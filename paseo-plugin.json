@@ -1,0 +1,15 @@
+{
+  "id": "antigravity-approval",
+  "name": "Antigravity ACP",
+  "description": "Google Antigravity (agy acp) provider with interactive tool approvals, per-model thinking levels, background & Swarm continuation, and a live Swarm board.",
+  "translations": {
+    "zh-CN": {
+      "name": "Antigravity · 审批与 Swarm (ACP)",
+      "description": "通过官方 agy acp 接入 Google Antigravity：支持工具审批、按模型独立思维档位、异步与 Swarm 回合自动接续及内置 Swarm 实时可视化看板。"
+    }
+  },
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.15.4"
+  }
+}

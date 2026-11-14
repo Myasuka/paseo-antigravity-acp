@@ -1,0 +1,8 @@
+{
+  "readOnlyRoots": [
+    "~/.agents/skills",
+    "~/.codex/skills",
+    "~/.claude/skills",
+    "~/.gemini/antigravity-cli/builtin/skills"
+  ]
+}

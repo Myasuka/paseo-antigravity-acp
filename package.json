@@ -1,0 +1,58 @@
+{
+  "name": "paseo-antigravity-acp",
+  "version": "0.2.0",
+  "description": "Google Antigravity (agy acp) provider plugin for Paseo with interactive approvals, per-model thinking, background & Swarm continuation, and a live Swarm visualizer.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Myasuka/paseo-antigravity-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Myasuka/paseo-antigravity-acp/issues"
+  },
+  "homepage": "https://github.com/Myasuka/paseo-antigravity-acp#readme",
+  "keywords": [
+    "paseo",
+    "paseo-plugin",
+    "antigravity",
+    "agy",
+    "acp",
+    "swarm"
+  ],
+  "files": [
+    "paseo-plugin.json",
+    "LICENSE",
+    "README.md",
+    "README.*.md",
+    "OVERVIEW.md",
+    "OVERVIEW.*.md",
+    "index.client.ts",
+    "index.client.tsx",
+    "index.server.ts",
+    "index.server.tsx",
+    "client/",
+    "server/",
+    "shared/"
+  ],
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check:sanitize": "node scripts/check-sanitization.mjs",
+    "test": "node scripts/check-sanitization.mjs && node tests/resolve-agy.mjs && node tests/access-policy.mjs && node --experimental-strip-types tests/failed-tool-history.mjs && node tests/session-metadata.mjs && node --experimental-strip-types tests/tool-presentation.mjs && node tests/background-drain.mjs && node --experimental-strip-types tests/native-full-access.mjs && node --experimental-strip-types tests/model-thinking.mjs && node --experimental-strip-types tests/swarm-snapshot.mjs && node tests/client-contributions.mjs"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "@getpaseo/client": "0.15.4",
+    "@getpaseo/plugin": "0.15.4",
+    "@getpaseo/protocol": "0.15.4",
+    "@types/node": "^24.0.0",
+    "@types/react": "~19.2.0",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  }
+}
