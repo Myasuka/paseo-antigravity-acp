@@ -689,4 +689,293 @@ await scenario(async ({ root, bridge, append, begin }) => {
   assert.match(res.error.message, /Swarm worker has not returned progress or an ACP approval request/);
 });
 
+// Regression 1: Prefer untruncated transcript_full.jsonl over truncated transcript.jsonl for long commands and >2KB replies.
+await scenario(async ({ root, bridge, emitted, begin }) => {
+  const longCmd = 'python3 -c "' + 'x'.repeat(2400) + '"';
+  const longReply = 'FULL_REPLY_START_' + 'Y'.repeat(4052) + '_FULL_REPLY_END';
+  const compactPath = join(root, 'brain', id, '.system_generated/logs/transcript.jsonl');
+  const fullPath = join(root, 'brain', id, '.system_generated/logs/transcript_full.jsonl');
+
+  await writeFile(compactPath, '');
+  await writeFile(fullPath, '');
+  await begin();
+
+  await appendFile(
+    compactPath,
+    lines([
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'long check' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        truncated_fields: ['tool_calls'],
+        tool_calls: [{ name: 'run_command', args: { CommandLine: '"python3 -c \\"' + 'x'.repeat(1800) + '\n<truncated 1987 bytes>', WaitMsBeforeAsync: '1' } }],
+      },
+      launch(2, 'task-2'),
+    ]),
+  );
+  await appendFile(
+    fullPath,
+    lines([
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'long check' },
+      tool(1, longCmd),
+      launch(2, 'task-2'),
+    ]),
+  );
+
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-trunc-1',
+        name: 'run_command',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput: { CommandLine: longCmd, WaitMsBeforeAsync: 1 },
+      },
+    },
+  });
+
+  const done = bridge.fromAgent(response);
+  await appendFile(
+    compactPath,
+    lines([
+      finished(3, 'task-2'),
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', truncated_fields: ['content'], content: longReply.slice(0, 2982) },
+    ]),
+  );
+  await appendFile(fullPath, lines([finished(3, 'task-2'), message(4, longReply)]));
+
+  const res = await done;
+  assert.equal(res.result.stopReason, 'end_turn');
+  const toolUpdates = emitted.filter(e => e.params?.update?.sessionUpdate === 'tool_call_update');
+  assert.equal(toolUpdates.length, 1);
+  assert.equal(toolUpdates[0].params.update.toolCallId, 'call-trunc-1');
+  assert.equal(toolUpdates[0].params.update.status, 'completed');
+  assert.equal(
+    emitted.filter(e => e.params?.update?.sessionUpdate === 'tool_call').length,
+    0,
+    'Must match original call-trunc-1 rather than emitting synthetic agy:... duplicate',
+  );
+  const msgUpdates = emitted.filter(e => e.params?.update?.sessionUpdate === 'agent_message_chunk');
+  assert.equal(msgUpdates.length, 1);
+  assert.equal(msgUpdates[0].params.update.content.text, longReply);
+  assert.ok(msgUpdates[0].params.update.content.text.endsWith('_FULL_REPLY_END'));
+});
+
+// Regression 2: Foreground backgrounded tool finished before foreground final reply must close BEFORE final message (no spanning checkpoint).
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'fg bg check' },
+    tool(1, command),
+    launch(2, 'task-2'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Refreshing status' },
+    finished(4, 'task-2'),
+    message(5, 'FG_FINAL_CONCLUSION'),
+  ]);
+
+  const callMsg = await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-fg-bg',
+        title: command,
+        name: 'run_command',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput: { CommandLine: command, WaitMsBeforeAsync: 1 },
+      },
+    },
+  });
+  assert.ok(callMsg);
+
+  const emittedBeforeInterim = emitted.length;
+  const interim = await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Refreshing status' } } },
+  });
+  assert.ok(interim);
+
+  const finalChunk = await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FG_FINAL_CONCLUSION' } } },
+  });
+  assert.ok(finalChunk);
+
+  const closeEvents = emitted.slice(emittedBeforeInterim).filter(e => e.params?.update?.toolCallId === 'call-fg-bg');
+  assert.equal(closeEvents.length, 1, 'call-fg-bg must close BEFORE final foreground reply is returned to ACP');
+  assert.equal(closeEvents[0].params.update.status, 'completed');
+
+  const countAtPromptEnd = emitted.length;
+  const res = await bridge.fromAgent(response);
+  assert.equal(res.result.stopReason, 'end_turn');
+  assert.equal(emitted.length, countAtPromptEnd, 'Must not emit any updates after foreground final reply');
+
+  // Re-sending stale update for already-closed foreground tool on Turn 2 must be suppressed.
+  await begin();
+  const staleClose = await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-fg-bg', title: command, status: 'completed' },
+    },
+  });
+  assert.equal(staleClose, null, 'Already-closed foreground tool update must be suppressed');
+  assert.equal((await bridge.fromAgent({ ...response, id: 2 })).result.stopReason, 'end_turn');
+});
+
+// Regression 3: Turn 2 delayed flush from agy acp of Turn 1 post-foreground thought/tool/message is deduplicated, while Turn 2 real updates pass.
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'turn 1' },
+    tool(1, command),
+    launch(2, 'task-2'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'STARTED' },
+  ]);
+  await observe('call-turn1-bg', command);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STARTED' } } },
+  });
+
+  const done1 = bridge.fromAgent(response);
+  await append([
+    finished(4, 'task-2'),
+    {
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      thinking: 'Inspecting log details now',
+      tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/report.txt"' } }],
+    },
+    { step_index: 6, type: 'GENERIC', status: 'DONE', content: 'REPORT_BODY' },
+    { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', thinking: 'Ready to answer', content: 'TURN1_FINAL_ANSWER' },
+  ]);
+  const res1 = await done1;
+  assert.equal(res1.result.stopReason, 'end_turn');
+  assert.ok(emitted.some(e => e.params.update.sessionUpdate === 'agent_thought_chunk' && e.params.update.content.text === 'Inspecting log details now'));
+  assert.ok(emitted.some(e => e.params.update.sessionUpdate === 'agent_message_chunk' && e.params.update.content.text === 'TURN1_FINAL_ANSWER'));
+
+  // Begin Turn 2
+  const req2 = {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'session/prompt',
+    params: { sessionId: id, prompt: [{ type: 'text', text: 'turn 2' }] },
+  };
+  await bridge.fromClient(req2);
+
+  // Simulate agy acp flushing Turn 1's buffered steps before answering Turn 2
+  const delayed = [
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Inspecting ' } },
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'log details now' } },
+    { sessionUpdate: 'tool_call', toolCallId: 'replayed-read-1', name: 'read_file', kind: 'read', status: 'in_progress', rawInput: { Path: '/tmp/report.txt' } },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'replayed-read-1', status: 'completed', rawOutput: { output: 'REPORT_BODY' } },
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Ready to answer' } },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'TURN1_FINAL_' } },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ANSWER' } },
+  ];
+  for (const update of delayed) {
+    const out = await bridge.fromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: id, update } });
+    assert.equal(out, null, `Stale Turn 1 replay update must be suppressed: ${update.sessionUpdate}`);
+  }
+
+  // Turn 2's real output passes through untouched
+  const t2Msg = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'TURN2_REAL_REPLY' } } },
+  });
+  assert.equal(t2Msg?.params?.update?.content?.text, 'TURN2_REAL_REPLY');
+  await append([
+    { step_index: 8, type: 'USER_INPUT', status: 'DONE', content: 'turn 2' },
+    { step_index: 9, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'TURN2_REAL_REPLY' },
+  ]);
+  const res2 = await bridge.fromAgent({ ...response, id: 2 });
+  assert.equal(res2.result.stopReason, 'end_turn');
+});
+
+// Regression 4: Partial-prefix match that diverges mid-stream must flush buffered prefix losslessly before forwarding the new update.
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'prefix check' },
+    tool(1, command),
+    launch(2, 'task-2'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'WAIT' },
+  ]);
+  await observe('call-prefix', command);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WAIT' } } },
+  });
+  const done1 = bridge.fromAgent(response);
+  await append([finished(4, 'task-2'), message(5, '整体表现完全符合预期：A')]);
+  assert.equal((await done1).result.stopReason, 'end_turn');
+
+  await bridge.fromClient({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'session/prompt',
+    params: { sessionId: id, prompt: [{ type: 'text', text: 'turn 2' }] },
+  });
+
+  const beforeDivergence = emitted.length;
+  const held = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '整体表现' } } },
+  });
+  assert.equal(held, null, 'Matching prefix chunk is buffered provisionally');
+  assert.equal(emitted.length, beforeDivergence);
+
+  const diverged = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '出现新波动：B' } } },
+  });
+  assert.equal(diverged?.params?.update?.content?.text, '出现新波动：B');
+  const recovered = emitted.slice(beforeDivergence).filter(e => e.params?.update?.sessionUpdate === 'agent_message_chunk');
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].params.update.content.text, '整体表现', 'Buffered prefix must be emitted before diverging chunk');
+  await append([
+    { step_index: 6, type: 'USER_INPUT', status: 'DONE', content: 'turn 2' },
+    message(7, '整体表现出现新波动：B'),
+  ]);
+  assert.equal((await bridge.fromAgent({ ...response, id: 2 })).result.stopReason, 'end_turn');
+});
+
+// Regression 5: session/load clears staleReplay and suppressedToolIds so history replay is never suppressed.
+await scenario(async ({ bridge, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'turn 1' },
+    tool(1, command),
+    launch(2, 'task-2'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'WAIT' },
+  ]);
+  await observe('call-load-check', command);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WAIT' } } },
+  });
+  const done1 = bridge.fromAgent(response);
+  await append([finished(4, 'task-2'), message(5, 'HIST_MSG_1')]);
+  assert.equal((await done1).result.stopReason, 'end_turn');
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 9, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  const histUpdate = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'HIST_MSG_1' } } },
+  });
+  assert.equal(histUpdate?.params?.update?.content?.text, 'HIST_MSG_1', 'session/load must reset stale replay filter');
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

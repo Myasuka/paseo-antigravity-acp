@@ -1,8 +1,16 @@
 import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
-import { TranscriptTail, BackgroundProjection } from './background-transcript.mjs';
+import { TranscriptTail, BackgroundProjection, signature } from './background-transcript.mjs';
 import { APPROVAL_SENSITIVE_TOOLS, UUID_RE, inspectSwarmContinuation } from './swarm-state.mjs';
+
+const STALE_PASS_THROUGH_UPDATES = new Set([
+  'available_commands_update',
+  'usage_update',
+  'session_info_update',
+  'current_mode_update',
+  'config_option_update',
+]);
 
 function wait(ms, signal) {
   return new Promise(resolvePromise => {
@@ -17,7 +25,7 @@ function wait(ms, signal) {
   });
 }
 
-async function readLastTranscriptRow(path) {
+async function readLastTranscriptRowFromPath(path) {
   let file;
   try {
     file = await open(path, 'r');
@@ -41,6 +49,15 @@ async function readLastTranscriptRow(path) {
   } finally {
     await file?.close();
   }
+}
+
+async function readLastTranscriptRow(path) {
+  const fullPath = /transcript\.jsonl$/.test(path) ? path.replace(/transcript\.jsonl$/, 'transcript_full.jsonl') : null;
+  if (fullPath && fullPath !== path) {
+    const fullRow = await readLastTranscriptRowFromPath(fullPath);
+    if (fullRow) return fullRow;
+  }
+  return readLastTranscriptRowFromPath(path);
 }
 
 export class BackgroundDrain {
@@ -76,7 +93,156 @@ export class BackgroundDrain {
     this.requests = new Map();
     this.permissions = new Map();
     this.sessions = new Map();
+    this.agentLane = Promise.resolve();
     this.closed = false;
+  }
+
+  ensureSession(sessionId) {
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = { round: null, suppressedToolIds: new Set(), staleReplay: null };
+      this.sessions.set(sessionId, session);
+    }
+    return session;
+  }
+
+  recordRoundReplay(session, round) {
+    if (!session || !round) return;
+    const snap = round.projection.takeStaleReplaySnapshot();
+    for (const toolId of snap.closedForegroundToolIds) {
+      session.suppressedToolIds.add(toolId);
+    }
+    while (session.suppressedToolIds.size > 512) {
+      const oldest = session.suppressedToolIds.values().next().value;
+      if (oldest === undefined) break;
+      session.suppressedToolIds.delete(oldest);
+    }
+    if (snap.thoughts.length || snap.messages.length || snap.toolSigs.length) {
+      session.staleReplay = {
+        active: true,
+        thoughts: [...snap.thoughts],
+        thoughtBuf: '',
+        thoughtTemplate: null,
+        messages: [...snap.messages],
+        messageBuf: '',
+        messageTemplate: null,
+        toolSigs: [...snap.toolSigs],
+      };
+    } else {
+      session.staleReplay = null;
+    }
+  }
+
+  filterStaleReplay(session, sessionId, update) {
+    if (!session || !update) return false;
+    if (
+      (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+      session.suppressedToolIds.has(update.toolCallId)
+    ) {
+      return true;
+    }
+    const stale = session.staleReplay;
+    if (!stale?.active) return false;
+    if (STALE_PASS_THROUGH_UPDATES.has(update.sessionUpdate)) return false;
+
+    const flushBufferedKind = kind => {
+      const queue = kind === 'thought' ? stale.thoughts : stale.messages;
+      const bufKey = kind === 'thought' ? 'thoughtBuf' : 'messageBuf';
+      const templateKey = kind === 'thought' ? 'thoughtTemplate' : 'messageTemplate';
+      const buf = stale[bufKey];
+      const template = stale[templateKey];
+      stale[bufKey] = '';
+      stale[templateKey] = null;
+      if (!buf) return;
+      if (queue[0] !== undefined && queue[0].trim() === buf.trim()) {
+        queue.shift();
+        return;
+      }
+      if (template) {
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: { sessionId, update: { ...template, content: { type: 'text', text: buf } } },
+        });
+      }
+      stale.active = false;
+    };
+
+    const flushBufferedPrefixes = excludeKind => {
+      if (excludeKind !== 'thought' && stale.thoughtBuf) flushBufferedKind('thought');
+      if (excludeKind !== 'message' && stale.messageBuf) flushBufferedKind('message');
+    };
+
+    const checkDone = () => {
+      if (
+        !stale.thoughts.length &&
+        !stale.messages.length &&
+        !stale.toolSigs.length &&
+        !stale.thoughtBuf &&
+        !stale.messageBuf
+      ) {
+        stale.active = false;
+      }
+    };
+
+    if (update.sessionUpdate === 'agent_thought_chunk' || update.sessionUpdate === 'agent_message_chunk') {
+      const kind = update.sessionUpdate === 'agent_thought_chunk' ? 'thought' : 'message';
+      flushBufferedPrefixes(kind);
+      if (!stale.active) return false;
+
+      const queue = kind === 'thought' ? stale.thoughts : stale.messages;
+      const bufKey = kind === 'thought' ? 'thoughtBuf' : 'messageBuf';
+      const templateKey = kind === 'thought' ? 'thoughtTemplate' : 'messageTemplate';
+      const chunkText = update.content?.type === 'text' ? update.content.text : '';
+      if (!chunkText) return true;
+
+      if (!stale[bufKey]) {
+        const idx = queue.findIndex(
+          target => target === chunkText || target.trim() === chunkText.trim() || target.startsWith(chunkText),
+        );
+        if (idx !== -1) queue.splice(0, idx);
+      }
+
+      const target = queue[0];
+      if (target !== undefined) {
+        const next = stale[bufKey] + chunkText;
+        if (target === next || (next.length >= target.trim().length && target.trim() === next.trim())) {
+          queue.shift();
+          stale[bufKey] = '';
+          stale[templateKey] = null;
+          checkDone();
+          return true;
+        }
+        if (target.startsWith(next)) {
+          stale[bufKey] = next;
+          stale[templateKey] ??= update;
+          return true;
+        }
+      }
+
+      flushBufferedKind(kind);
+      stale.active = false;
+      return false;
+    }
+
+    if (update.sessionUpdate === 'tool_call') {
+      flushBufferedPrefixes(null);
+      if (!stale.active) return false;
+      const sig = signature(update.name ?? update.title, update.rawInput ?? {});
+      const idx = stale.toolSigs.indexOf(sig);
+      if (idx !== -1) {
+        stale.toolSigs.splice(idx, 1);
+        session.suppressedToolIds.add(update.toolCallId);
+        checkDone();
+        return true;
+      }
+      stale.active = false;
+      return false;
+    }
+
+    flushBufferedPrefixes(null);
+    stale.active = false;
+    return false;
   }
 
   async inspectActiveSubagents(subIds = []) {
@@ -105,11 +271,18 @@ export class BackgroundDrain {
       return message;
     }
     const params = message.params ?? {};
+    if (['session/load', 'session/close'].includes(message.method) && params.sessionId) {
+      const session = this.sessions.get(params.sessionId);
+      if (session) {
+        session.suppressedToolIds.clear();
+        session.staleReplay = null;
+      }
+    }
     if (['session/cancel', 'session/close'].includes(message.method)) {
       this.sessions.get(params.sessionId)?.round?.controller.abort();
     }
     if (message.method === 'session/prompt' && UUID_RE.test(params.sessionId ?? '')) {
-      const session = this.sessions.get(params.sessionId) ?? {};
+      const session = this.ensureSession(params.sessionId);
       if (session.round) throw new Error('AGY already has an active foreground or background turn');
       const tail = new TranscriptTail(
         join(this.dataDir, 'brain', params.sessionId, '.system_generated/logs/transcript.jsonl'),
@@ -121,18 +294,46 @@ export class BackgroundDrain {
         projection: new BackgroundProjection(params.sessionId, this.emit),
         controller: new AbortController(),
       };
-      this.sessions.set(params.sessionId, session);
     }
     if ('id' in message) this.requests.set(message.id, { method: message.method, sessionId: params.sessionId });
     return message;
   }
 
-  async fromAgent(message) {
+  fromAgent(message) {
     if (message.method === 'session/request_permission' && 'id' in message) {
       this.permissions.set(message.id, message.params?.sessionId);
+      return Promise.resolve(message);
     }
     if (message.method === 'session/update') {
-      this.sessions.get(message.params?.sessionId)?.round?.projection.observe(message.params.update);
+      const run = this.agentLane.then(() => this._fromAgent(message));
+      this.agentLane = run.catch(() => undefined);
+      return run;
+    }
+    const isPromptResponse =
+      'id' in message && !message.method && this.requests.get(message.id)?.method === 'session/prompt';
+    if (!isPromptResponse) {
+      return this._fromAgent(message);
+    }
+    // Wait for any in-flight session/update reads before draining end_turn, without blocking non-prompt RPCs behind end_turn.
+    return this.agentLane.then(() => this._fromAgent(message));
+  }
+
+  async _fromAgent(message) {
+    if (message.method === 'session/update') {
+      const sessionId = message.params?.sessionId;
+      const update = message.params?.update;
+      const session = sessionId ? this.sessions.get(sessionId) : undefined;
+      if (this.filterStaleReplay(session, sessionId, update)) return null;
+      if (
+        session?.round &&
+        session.round.projection.hasOpenForegroundTools() &&
+        !(update?.sessionUpdate === 'tool_call_update' && session.round.projection.tools.has(update.toolCallId))
+      ) {
+        session.round.projection.add(await session.round.tail.read());
+        session.round.projection.flushCompletedForegroundTools();
+      }
+      session?.round?.projection.observe(update);
+      return message;
     }
     if (!('id' in message) || message.method) return message;
     const request = this.requests.get(message.id);
@@ -147,13 +348,23 @@ export class BackgroundDrain {
         return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
       }
       round.projection.add(await round.tail.read());
+      round.projection.flushCompletedForegroundTools();
       let state = round.projection.inspect();
       let swarmState = await inspectSwarmContinuation({
         dataDir: this.dataDir,
         sessionId: request.sessionId,
         wakeupGraceMs: this.swarmWakeupGraceMs,
       });
-      if (!state.seenBackground && !swarmState.active) return message;
+      if (
+        (!state.seenBackground && !swarmState.active) ||
+        (state.coordinatorSettled &&
+          !swarmState.active &&
+          !state.hasPostForegroundWork &&
+          !round.projection.hasOpenForegroundTools())
+      ) {
+        this.recordRoundReplay(session, round);
+        return message;
+      }
       const deadline = Date.now() + this.timeoutMs;
       let idleSince;
       let approvalStallSince;
@@ -202,6 +413,7 @@ export class BackgroundDrain {
                 if (typeof result.result.usage[key] === 'number') result.result.usage[key] += delta;
               }
             }
+            this.recordRoundReplay(session, round);
             return result;
           }
         } else {

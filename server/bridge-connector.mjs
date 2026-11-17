@@ -100,6 +100,7 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
   };
 
   const deliver = message => {
+    if (!message) return;
     const result = policy.fromAgent(metadata.fromAgent(preserveToolContent(message)));
     if (result.upstream) {
       background.permissionResolved(result.upstream.id);
@@ -144,16 +145,18 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
     closeDownstream();
   };
 
+  let agentQueue = Promise.resolve();
   rl.on('line', line => {
     if (!line.trim()) return;
-    void (async () => {
+    agentQueue = agentQueue.then(async () => {
+      if (stopping || streamClosed) return;
       try {
         deliver(await background.fromAgent(JSON.parse(line)));
       } catch (err) {
         errorDownstream(err instanceof Error ? err : new Error('Invalid agent ACP JSON'));
         stop();
       }
-    })();
+    });
   });
 
   child.on('error', err => {

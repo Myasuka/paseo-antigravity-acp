@@ -69,6 +69,7 @@ function write(stream, message) {
 }
 
 function deliver(message) {
+  if (!message) return;
   const result = policy.fromAgent(metadata.fromAgent(preserveToolContent(message)));
   if (result.upstream) {
     background.permissionResolved(result.upstream.id);
@@ -103,13 +104,18 @@ async function clientLine(line) {
   }
 }
 
-async function agentLine(line) {
-  try {
-    deliver(await background.fromAgent(JSON.parse(line)));
-  } catch {
-    process.stderr.write('Invalid agent ACP JSON.\n');
-    stop();
-  }
+let agentQueue = Promise.resolve();
+function agentLine(line) {
+  if (!line.trim()) return;
+  agentQueue = agentQueue.then(async () => {
+    if (stopping) return;
+    try {
+      deliver(await background.fromAgent(JSON.parse(line)));
+    } catch {
+      process.stderr.write('Invalid agent ACP JSON.\n');
+      stop();
+    }
+  });
 }
 
 createInterface({ input: process.stdin }).on('line', line => { void clientLine(line); }).on('close', stop);

@@ -21,6 +21,9 @@ const SERVER_RESTART_NOTICE_RE =
 export class TranscriptTail {
   constructor(path) {
     this.path = path;
+    this.compactPath = path;
+    this.fullPath = /transcript\.jsonl$/.test(path) ? path.replace(/transcript\.jsonl$/, 'transcript_full.jsonl') : null;
+    this.activePath = null;
     this.offset = 0;
     this.inode = null;
     this.anchor = '';
@@ -28,10 +31,35 @@ export class TranscriptTail {
     this.baseline = -1;
   }
 
+  async resolvePath() {
+    if (this.activePath) return this.activePath;
+    if (this.fullPath) {
+      try {
+        await stat(this.fullPath);
+        this.activePath = this.fullPath;
+        return this.activePath;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    try {
+      const info = await stat(this.compactPath);
+      if (info.size > 0) {
+        this.activePath = this.compactPath;
+        return this.activePath;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    return null;
+  }
+
   async begin() {
+    const targetPath = await this.resolvePath();
+    if (!targetPath) return;
     let file;
     try {
-      file = await open(this.path, 'r');
+      file = await open(targetPath, 'r');
       const info = await file.stat();
       const size = Math.min(info.size, 8 * 1024 * 1024);
       const buffer = Buffer.alloc(size);
@@ -64,14 +92,16 @@ export class TranscriptTail {
   }
 
   async read() {
+    const targetPath = await this.resolvePath();
+    if (!targetPath) return [];
     let info;
     try {
-      info = await stat(this.path);
+      info = await stat(targetPath);
     } catch (error) {
       if (error.code === 'ENOENT') return [];
       throw error;
     }
-    const file = await open(this.path, 'r');
+    const file = await open(targetPath, 'r');
     try {
       const bytes = Math.min(64, this.offset);
       const check = Buffer.alloc(bytes);
@@ -100,8 +130,7 @@ export class TranscriptTail {
             throw new Error('Invalid AGY transcript JSONL record');
           }
           if (Number.isInteger(raw.step_index) && raw.step_index > this.baseline) {
-            const { thinking, ...row } = raw;
-            rows.push(row);
+            rows.push(raw);
           }
         }
         if (pending.length > 8 * 1024 * 1024) throw new Error('AGY transcript line exceeds 8 MiB');
@@ -140,7 +169,7 @@ function stable(value) {
   return value;
 }
 
-function signature(name, args) {
+export function signature(name, args) {
   return JSON.stringify([name, stable(args)]);
 }
 
@@ -163,7 +192,7 @@ function exitCode(content) {
   return match ? Number(match[1]) : undefined;
 }
 
-function matchForegroundGroups(groups, plannerRows) {
+function matchForegroundGroups(groups, plannerRows, textField = 'content') {
   const covered = new Set();
   let foregroundEnd = -1;
   let cursor = 0;
@@ -171,7 +200,7 @@ function matchForegroundGroups(groups, plannerRows) {
     const target = rawGroup.trim();
     if (!target) continue;
     for (let start = cursor; start < plannerRows.length; start++) {
-      const first = plannerRows[start].content.trim();
+      const first = (plannerRows[start][textField] ?? '').trim();
       if (first === target) {
         covered.add(plannerRows[start].step_index);
         foregroundEnd = Math.max(foregroundEnd, plannerRows[start].step_index);
@@ -182,7 +211,7 @@ function matchForegroundGroups(groups, plannerRows) {
       let joined = first;
       let matchedEnd = -1;
       for (let end = start + 1; end < plannerRows.length; end++) {
-        const piece = plannerRows[end].content.trim();
+        const piece = (plannerRows[end][textField] ?? '').trim();
         const direct = joined + piece;
         const spaced = joined + '\n' + piece;
         if (direct === target || spaced === target) {
@@ -214,9 +243,16 @@ export class BackgroundProjection {
     this.tools = new Map();
     this.groups = [];
     this.currentGroup = null;
+    this.thoughtGroups = [];
+    this.currentThoughtGroup = null;
     this.sent = new Map();
     this.covered = new Set();
+    this.coveredThoughts = new Set();
     this.foregroundEnd = -1;
+    this.closedForegroundToolIds = new Set();
+    this.drainedThoughts = [];
+    this.drainedMessages = [];
+    this.drainedToolSigs = [];
   }
 
   observe(update) {
@@ -226,18 +262,47 @@ export class BackgroundProjection {
         this.currentGroup = this.groups.length - 1;
       }
       this.groups[this.currentGroup] += update.content.text;
-    } else if (['tool_call', 'agent_thought_chunk', 'user_message_chunk', 'plan'].includes(update.sessionUpdate)) {
+      this.currentThoughtGroup = null;
+    } else if (update.sessionUpdate === 'agent_thought_chunk' && update.content?.type === 'text') {
+      if (this.currentThoughtGroup === null) {
+        this.thoughtGroups.push('');
+        this.currentThoughtGroup = this.thoughtGroups.length - 1;
+      }
+      this.thoughtGroups[this.currentThoughtGroup] += update.content.text;
       this.currentGroup = null;
+    } else if (['tool_call', 'user_message_chunk', 'plan'].includes(update.sessionUpdate)) {
+      this.currentGroup = null;
+      this.currentThoughtGroup = null;
     }
     if (!['tool_call', 'tool_call_update'].includes(update.sessionUpdate)) return;
     const old = this.tools.get(update.toolCallId) ?? {};
     this.tools.set(update.toolCallId, {
       ...old,
       id: update.toolCallId,
-      name: update.name ?? old.name,
+      name: update.name ?? old.name ?? update.title,
       input: update.rawInput ?? old.input,
       status: update.status ?? old.status,
     });
+  }
+
+  hasOpenForegroundTools() {
+    for (const tool of this.tools.values()) {
+      if (tool.status === 'pending' || tool.status === 'in_progress') return true;
+    }
+    return false;
+  }
+
+  flushCompletedForegroundTools() {
+    this.inspect({ publish: false, flushForegroundOnly: true });
+  }
+
+  takeStaleReplaySnapshot() {
+    return {
+      closedForegroundToolIds: [...this.closedForegroundToolIds],
+      thoughts: [...this.drainedThoughts],
+      messages: [...this.drainedMessages],
+      toolSigs: [...this.drainedToolSigs],
+    };
   }
 
   add(rows) {
@@ -250,12 +315,13 @@ export class BackgroundProjection {
 
   once(key, value, update) {
     const encoded = JSON.stringify(value);
-    if (this.sent.get(key) === encoded) return;
+    if (this.sent.get(key) === encoded) return false;
     this.sent.set(key, encoded);
     this.notify(update);
+    return true;
   }
 
-  inspect({ publish = false } = {}) {
+  inspect({ publish = false, flushForegroundOnly = false } = {}) {
     const rows = [...this.rows.values()].sort((a, b) => a.step_index - b.step_index);
     if (rows.filter(row => row.type === 'USER_INPUT').length > 1) {
       return { seenBackground: true, foreignInput: true, drained: false };
@@ -278,9 +344,14 @@ export class BackgroundProjection {
       if (refs.length) calls.set(row.step_index, refs);
     }
     const plannerRows = rows.filter(row => row.type === 'PLANNER_RESPONSE' && row.content?.trim());
-    const groupMatch = matchForegroundGroups(this.groups, plannerRows);
+    const groupMatch = matchForegroundGroups(this.groups, plannerRows, 'content');
     for (const step of groupMatch.covered) this.covered.add(step);
     this.foregroundEnd = Math.max(this.foregroundEnd, groupMatch.foregroundEnd);
+
+    const thoughtRows = rows.filter(row => row.type === 'PLANNER_RESPONSE' && row.thinking?.trim());
+    const thoughtMatch = matchForegroundGroups(this.thoughtGroups, thoughtRows, 'thinking');
+    for (const step of thoughtMatch.covered) this.coveredThoughts.add(step);
+    this.foregroundEnd = Math.max(this.foregroundEnd, thoughtMatch.foregroundEnd);
 
     const queue = [];
     const pending = new Map();
@@ -298,9 +369,20 @@ export class BackgroundProjection {
     let failure;
     const extraUsage = { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, totalTokens: 0 };
 
+    const markForegroundToolClosed = (ref, status) => {
+      if (!ref.raw) return;
+      const existing = this.tools.get(ref.id);
+      if (existing) existing.status = status;
+      this.closedForegroundToolIds.add(ref.id);
+    };
+
     const complete = (ref, content, failed = false, extraOutput = {}) => {
       pending.delete(ref.key);
-      if (!publish) return;
+      const isForegroundOpen =
+        ref.raw &&
+        (this.tools.get(ref.id)?.status === 'pending' || this.tools.get(ref.id)?.status === 'in_progress');
+      if (!publish && !(flushForegroundOnly && isForegroundOpen)) return;
+      if (flushForegroundOnly && !isForegroundOpen) return;
       const code = exitCode(content);
       const status = failed || (code !== undefined && code !== 0) ? 'failed' : 'completed';
       const rawOutput = { output: content, ...(code !== undefined ? { exit_code: code } : {}), ...extraOutput };
@@ -310,6 +392,7 @@ export class BackgroundProjection {
         status,
         rawOutput,
       });
+      markForegroundToolClosed(ref, status);
     };
 
     const settleSubagent = (subId, output, failed = false) => {
@@ -331,19 +414,21 @@ export class BackgroundProjection {
         lastPlannerStep = row.step_index;
         lastPlannerCalls = refs;
         genericsSinceLastPlanner = [];
-        for (const ref of refs) {
-          if (SWARM_TOOLS.has(ref.name)) seenSwarm = true;
-          queue.push(ref);
-          pending.set(ref.key, ref);
-          if (publish && !ref.raw) {
-            this.once(`call:${ref.key}`, [ref.name, ref.input], {
-              sessionUpdate: 'tool_call',
-              toolCallId: ref.id,
-              name: ref.name,
-              title: ref.name,
-              kind: toolKind(ref.name),
-              status: 'in_progress',
-              rawInput: ref.input,
+        if (
+          publish &&
+          row.step_index > this.foregroundEnd &&
+          !this.coveredThoughts.has(row.step_index) &&
+          row.status === 'DONE' &&
+          row.thinking?.trim()
+        ) {
+          const thoughtKey = `thought:${row.step_index}`;
+          if (!this.sent.has(thoughtKey)) {
+            this.sent.set(thoughtKey, row.thinking);
+            this.drainedThoughts.push(row.thinking);
+            this.notify({
+              sessionUpdate: 'agent_thought_chunk',
+              messageId: `agy:${this.sessionId}:thought:${row.step_index}`,
+              content: { type: 'text', text: row.thinking },
             });
           }
         }
@@ -357,11 +442,29 @@ export class BackgroundProjection {
           const key = `message:${row.step_index}`;
           if (!this.sent.has(key)) {
             this.sent.set(key, row.content);
+            this.drainedMessages.push(row.content);
             this.notify({
               sessionUpdate: 'agent_message_chunk',
               messageId: `agy:${this.sessionId}:message:${row.step_index}`,
               content: { type: 'text', text: row.content },
             });
+          }
+        }
+        for (const ref of refs) {
+          if (SWARM_TOOLS.has(ref.name)) seenSwarm = true;
+          queue.push(ref);
+          pending.set(ref.key, ref);
+          if (publish && !ref.raw && row.step_index > this.foregroundEnd) {
+            const emittedCall = this.once(`call:${ref.key}`, [ref.name, ref.input], {
+              sessionUpdate: 'tool_call',
+              toolCallId: ref.id,
+              name: ref.name,
+              title: ref.name,
+              kind: toolKind(ref.name),
+              status: 'in_progress',
+              rawInput: ref.input,
+            });
+            if (emittedCall) this.drainedToolSigs.push(signature(ref.name, ref.input));
           }
         }
         if (row.step_index > this.foregroundEnd && row.status === 'DONE') {
@@ -377,8 +480,9 @@ export class BackgroundProjection {
         genericsSinceLastPlanner.push(row);
         const ref = queue.shift();
         const content = row.content ?? '';
+        const isDaemon = ref.name === 'run_command' && ref.input?.IsDaemon === true;
         const task =
-          ref.name === 'run_command'
+          ref.name === 'run_command' && !isDaemon
             ? /(?:^|\n)Tool is running as a background task with task id: ([^\s]+)/.exec(header(content))?.[1]
             : undefined;
         const createdSubId =
@@ -526,9 +630,16 @@ export class BackgroundProjection {
         latest.step_index > lastWake) ||
         parkedOnSwarmWait);
 
+    const hasPostForegroundWork = rows.some(
+      row =>
+        row.step_index > this.foregroundEnd &&
+        ['PLANNER_RESPONSE', 'SYSTEM_MESSAGE', 'ERROR_MESSAGE'].includes(row.type),
+    );
+
     return {
       seenBackground,
       seenSwarm,
+      hasPostForegroundWork,
       parkedOnSwarmWait,
       coordinatorSettled,
       pendingTasks: totalPendingBg,
