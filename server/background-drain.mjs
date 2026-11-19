@@ -12,6 +12,16 @@ const STALE_PASS_THROUGH_UPDATES = new Set([
   'config_option_update',
 ]);
 
+// Post-load metadata updates that should flush after LOAD_RES (and after
+// AcpRuntime exits replayWindow) rather than before LOAD_RES where
+// history:"skip" would drop them. Excludes current_mode_update and
+// config_option_update so pre-load notifications cannot race applyInitialConfig().
+const DEFERRED_LOAD_META_UPDATES = new Set([
+  'available_commands_update',
+  'usage_update',
+  'session_info_update',
+]);
+
 function wait(ms, signal) {
   return new Promise(resolvePromise => {
     const done = () => {
@@ -71,6 +81,9 @@ export class BackgroundDrain {
     subagentFailureGraceMs = 5000,
     swarmWakeupGraceMs = 15000,
     nativeFull = process.env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
+    loadSettleMs = 400,
+    loadMaxWaitMs = 15000,
+    loadMetaFlushDelayMs = 15,
   }) {
     this.emit = emit;
     this.dataDir =
@@ -90,6 +103,9 @@ export class BackgroundDrain {
     this.subagentFailureGraceMs = subagentFailureGraceMs;
     this.swarmWakeupGraceMs = swarmWakeupGraceMs;
     this.nativeFull = nativeFull;
+    this.loadSettleMs = loadSettleMs;
+    this.loadMaxWaitMs = loadMaxWaitMs;
+    this.loadMetaFlushDelayMs = loadMetaFlushDelayMs;
     this.requests = new Map();
     this.permissions = new Map();
     this.sessions = new Map();
@@ -100,10 +116,115 @@ export class BackgroundDrain {
   ensureSession(sessionId) {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { round: null, suppressedToolIds: new Set(), staleReplay: null };
+      session = {
+        round: null,
+        suppressedToolIds: new Set(),
+        staleReplay: null,
+        pendingLoad: null,
+        deferredMetaFlush: null,
+      };
       this.sessions.set(sessionId, session);
     }
     return session;
+  }
+
+  cancelPendingLoad(session) {
+    const pending = session?.pendingLoad;
+    if (!pending) return;
+    if (pending.settleTimer) clearTimeout(pending.settleTimer);
+    if (pending.maxTimer) clearTimeout(pending.maxTimer);
+    pending.settleTimer = null;
+    pending.maxTimer = null;
+    session.pendingLoad = null;
+  }
+
+  cancelDeferredMetaFlush(session) {
+    const deferred = session?.deferredMetaFlush;
+    if (!deferred) return;
+    if (deferred.timer) clearTimeout(deferred.timer);
+    deferred.timer = null;
+    session.deferredMetaFlush = null;
+  }
+
+  flushDeferredMeta(session) {
+    const deferred = session?.deferredMetaFlush;
+    if (!deferred) return;
+    if (deferred.timer) clearTimeout(deferred.timer);
+    session.deferredMetaFlush = null;
+    if (this.closed) return;
+    for (const meta of deferred.items) {
+      this.emit(meta);
+    }
+  }
+
+  armPendingLoadSettleTimer(sessionId, pending) {
+    if (pending.settleTimer) clearTimeout(pending.settleTimer);
+    const expectedGen = pending.generation;
+    pending.settleTimer = setTimeout(() => {
+      pending.settleTimer = null;
+      const run = this.agentLane.then(() => {
+        const session = this.sessions.get(sessionId);
+        if (this.closed || !session || session.pendingLoad !== pending || pending.generation !== expectedGen) {
+          return;
+        }
+        this.flushPendingLoad(session);
+      });
+      this.agentLane = run.catch(() => undefined);
+    }, this.loadSettleMs);
+  }
+
+  holdPendingLoad(sessionId, session, response) {
+    this.cancelPendingLoad(session);
+    this.cancelDeferredMetaFlush(session);
+    const pending = {
+      sessionId,
+      response,
+      deferredMeta: new Map(),
+      generation: 0,
+      settleTimer: null,
+      maxTimer: null,
+    };
+    session.pendingLoad = pending;
+    this.armPendingLoadSettleTimer(sessionId, pending);
+    if (this.loadMaxWaitMs > 0) {
+      pending.maxTimer = setTimeout(() => {
+        pending.maxTimer = null;
+        const run = this.agentLane.then(() => {
+          const currentSession = this.sessions.get(sessionId);
+          if (this.closed || !currentSession || currentSession.pendingLoad !== pending) {
+            return;
+          }
+          this.flushPendingLoad(currentSession);
+        });
+        this.agentLane = run.catch(() => undefined);
+      }, this.loadMaxWaitMs);
+    }
+  }
+
+  flushPendingLoad(session, { immediateMeta = false } = {}) {
+    const pending = session?.pendingLoad;
+    if (!pending) return;
+    this.cancelPendingLoad(session);
+    if (this.closed) return;
+    this.emit(pending.response);
+    const metaMessages = [...pending.deferredMeta.values()];
+    if (metaMessages.length === 0) return;
+    if (immediateMeta || this.loadMetaFlushDelayMs <= 0) {
+      for (const meta of metaMessages) {
+        this.emit(meta);
+      }
+      return;
+    }
+    const deferred = {
+      items: metaMessages,
+      timer: null,
+    };
+    deferred.timer = setTimeout(() => {
+      if (session.deferredMetaFlush === deferred) {
+        this.flushDeferredMeta(session);
+      }
+    }, this.loadMetaFlushDelayMs);
+    session.deferredMetaFlush = deferred;
   }
 
   recordRoundReplay(session, round) {
@@ -276,10 +397,20 @@ export class BackgroundDrain {
       if (session) {
         session.suppressedToolIds.clear();
         session.staleReplay = null;
+        this.cancelPendingLoad(session);
+        this.cancelDeferredMetaFlush(session);
       }
     }
     if (['session/cancel', 'session/close'].includes(message.method)) {
       this.sessions.get(params.sessionId)?.round?.controller.abort();
+    }
+    if (message.method === 'session/prompt') {
+      const existing = params.sessionId ? this.sessions.get(params.sessionId) : undefined;
+      if (existing?.pendingLoad) {
+        this.flushPendingLoad(existing, { immediateMeta: true });
+      } else if (existing?.deferredMetaFlush) {
+        this.flushDeferredMeta(existing);
+      }
     }
     if (message.method === 'session/prompt' && UUID_RE.test(params.sessionId ?? '')) {
       const session = this.ensureSession(params.sessionId);
@@ -305,17 +436,22 @@ export class BackgroundDrain {
       return Promise.resolve(message);
     }
     if (message.method === 'session/update') {
+      const sid = message.params?.sessionId;
+      const pending = sid ? this.sessions.get(sid)?.pendingLoad : null;
+      if (pending) pending.generation += 1;
       const run = this.agentLane.then(() => this._fromAgent(message));
       this.agentLane = run.catch(() => undefined);
       return run;
     }
-    const isPromptResponse =
-      'id' in message && !message.method && this.requests.get(message.id)?.method === 'session/prompt';
-    if (!isPromptResponse) {
-      return this._fromAgent(message);
+    if ('id' in message && !message.method) {
+      const reqMethod = this.requests.get(message.id)?.method;
+      if (reqMethod === 'session/prompt' || reqMethod === 'session/load') {
+        // Wait for queued session/update reads before draining end_turn or arming session/load quiescence,
+        // without blocking unrelated RPC responses.
+        return this.agentLane.then(() => this._fromAgent(message));
+      }
     }
-    // Wait for any in-flight session/update reads before draining end_turn, without blocking non-prompt RPCs behind end_turn.
-    return this.agentLane.then(() => this._fromAgent(message));
+    return this._fromAgent(message);
   }
 
   async _fromAgent(message) {
@@ -323,6 +459,17 @@ export class BackgroundDrain {
       const sessionId = message.params?.sessionId;
       const update = message.params?.update;
       const session = sessionId ? this.sessions.get(sessionId) : undefined;
+      if (session?.pendingLoad) {
+        this.armPendingLoadSettleTimer(sessionId, session.pendingLoad);
+        const kind = update?.sessionUpdate;
+        if (DEFERRED_LOAD_META_UPDATES.has(kind)) {
+          // Refresh insertion order so the latest snapshot for each metadata kind flushes after LOAD_RES.
+          session.pendingLoad.deferredMeta.delete(kind);
+          session.pendingLoad.deferredMeta.set(kind, message);
+          return null;
+        }
+        return message;
+      }
       if (this.filterStaleReplay(session, sessionId, update)) return null;
       if (
         session?.round &&
@@ -338,6 +485,14 @@ export class BackgroundDrain {
     if (!('id' in message) || message.method) return message;
     const request = this.requests.get(message.id);
     this.requests.delete(message.id);
+    if (request?.method === 'session/load') {
+      if (message.error || this.closed || this.loadSettleMs <= 0) return message;
+      const sessionId = request.sessionId || message.result?.sessionId;
+      if (!sessionId) return message;
+      const session = this.ensureSession(sessionId);
+      this.holdPendingLoad(sessionId, session, message);
+      return null;
+    }
     if (request?.method !== 'session/prompt') return message;
     const session = this.sessions.get(request.sessionId);
     const round = session?.round;
@@ -443,7 +598,11 @@ export class BackgroundDrain {
 
   close() {
     this.closed = true;
-    for (const session of this.sessions.values()) session.round?.controller.abort();
+    for (const session of this.sessions.values()) {
+      session.round?.controller.abort();
+      this.cancelPendingLoad(session);
+      this.cancelDeferredMetaFlush(session);
+    }
     this.sessions.clear();
     this.requests.clear();
     this.permissions.clear();

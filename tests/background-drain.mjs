@@ -978,4 +978,192 @@ await scenario(async ({ bridge, append, begin, observe }) => {
   assert.equal(histUpdate?.params?.update?.content?.text, 'HIST_MSG_1', 'session/load must reset stale replay filter');
 });
 
+// Regression 6: session/load barrier holds LOAD_RES until late replay updates go quiescent.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 35;
+  bridge.loadMetaFlushDelayMs = 5;
+  bridge.loadMaxWaitMs = 400;
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 101, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  const loadRes = { jsonrpc: '2.0', id: 101, result: { sessionId: id, modes: null, configOptions: [] } };
+  const held = await bridge.fromAgent(loadRes);
+  assert.equal(held, null, 'session/load response must be held until replay quiesces');
+  assert.equal(emitted.length, 0);
+
+  const replayUpdates = [
+    { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'late user' } },
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'late thought' } },
+    { sessionUpdate: 'tool_call', toolCallId: 'late-tool-1', name: 'read_file', kind: 'read', status: 'completed' },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'late reply' } },
+  ];
+  for (const update of replayUpdates) {
+    await delay(12);
+    const forwarded = await bridge.fromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: id, update } });
+    assert.ok(forwarded, `Late replay ${update.sessionUpdate} must pass through immediately before LOAD_RES`);
+    assert.equal(emitted.length, 0, 'LOAD_RES must remain held while replay chunks are arriving');
+  }
+
+  await delay(60);
+  assert.equal(emitted.length, 1);
+  assert.deepEqual(emitted[0], loadRes);
+});
+
+// Regression 7: Interleaved metadata resets settle timer, keeps subsequent replay chunks before LOAD_RES, and coalesces metadata after LOAD_RES.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 35;
+  bridge.loadMetaFlushDelayMs = 10;
+  bridge.loadMaxWaitMs = 500;
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 102, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  const loadRes = { jsonrpc: '2.0', id: 102, result: { sessionId: id, modes: null, configOptions: [] } };
+  assert.equal(await bridge.fromAgent(loadRes), null);
+
+  await delay(20);
+  const cmdMsg = {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'plan', description: 'Plan' }] } },
+  };
+  const usage1 = {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'usage_update', used: 100, size: 1000 } },
+  };
+  const infoMsg = {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'session_info_update', title: 'Restored' } },
+  };
+  assert.equal(await bridge.fromAgent(cmdMsg), null);
+  assert.equal(await bridge.fromAgent(usage1), null);
+  assert.equal(await bridge.fromAgent(infoMsg), null);
+
+  await delay(20);
+  assert.equal(emitted.length, 0, 'Metadata updates must reset settle timer and keep LOAD_RES held');
+
+  const afterMetaTool = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'after-meta-tool', name: 'read_file', kind: 'read', status: 'completed' } },
+  });
+  const afterMetaMsg = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'still part of replay' } } },
+  });
+  assert.ok(afterMetaTool, 'Tool call after available_commands_update must still arrive before LOAD_RES');
+  assert.ok(afterMetaMsg, 'Assistant message after available_commands_update must still arrive before LOAD_RES');
+
+  const usage2 = {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'usage_update', used: 500, size: 1000 } },
+  };
+  assert.equal(await bridge.fromAgent(usage2), null);
+  assert.equal(emitted.length, 0);
+
+  await delay(45);
+  assert.equal(emitted.length, 1, 'LOAD_RES emits once quiet, before deferred metadata delay elapses');
+  assert.deepEqual(emitted[0], loadRes);
+
+  await delay(25);
+  assert.equal(emitted.length, 4, 'Coalesced deferred metadata flushes after loadMetaFlushDelayMs');
+  assert.deepEqual(
+    emitted.slice(1).map(m => m.params.update.sessionUpdate),
+    ['available_commands_update', 'session_info_update', 'usage_update'],
+  );
+  assert.equal(emitted[3].params.update.used, 500, 'Latest usage_update snapshot wins');
+});
+
+// Regression 8: current_mode_update and config_option_update are never deferred past LOAD_RES so they cannot race applyInitialConfig.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 30;
+  bridge.loadMetaFlushDelayMs = 5;
+  bridge.loadMaxWaitMs = 300;
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 103, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  assert.equal(await bridge.fromAgent({ jsonrpc: '2.0', id: 103, result: { sessionId: id } }), null);
+
+  await delay(15);
+  const modeOut = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'current_mode_update', currentModeId: 'default' } },
+  });
+  const cfgOut = await bridge.fromAgent({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'config_option_update', configOptions: [] } },
+  });
+  assert.equal(modeOut?.params?.update?.sessionUpdate, 'current_mode_update');
+  assert.equal(cfgOut?.params?.update?.sessionUpdate, 'config_option_update');
+  assert.equal(emitted.length, 0, 'Mode/config updates pass immediately while LOAD_RES stays held');
+
+  await delay(50);
+  assert.equal(emitted.length, 1, 'LOAD_RES releases cleanly with zero extra deferred metadata');
+  assert.equal(emitted[0].id, 103);
+});
+
+// Regression 9: Error session/load responses bypass the barrier immediately.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 500;
+  await bridge.fromClient({ jsonrpc: '2.0', id: 104, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  const errRes = { jsonrpc: '2.0', id: 104, error: { code: -32001, message: 'Session not found' } };
+  const out = await bridge.fromAgent(errRes);
+  assert.deepEqual(out, errRes);
+  assert.equal(emitted.length, 0);
+});
+
+// Regression 10: Continuous replay updates without a long gap are bounded by loadMaxWaitMs.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 45;
+  bridge.loadMaxWaitMs = 95;
+  bridge.loadMetaFlushDelayMs = 5;
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 105, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  assert.equal(await bridge.fromAgent({ jsonrpc: '2.0', id: 105, result: { sessionId: id } }), null);
+
+  let releasedAt = null;
+  for (let i = 0; i < 12; i++) {
+    await delay(15);
+    await bridge.fromAgent({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: id, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `chunk-${i}` } } },
+    });
+    if (releasedAt === null && emitted.some(m => m.id === 105)) {
+      releasedAt = i;
+    }
+  }
+  assert.notEqual(releasedAt, null, 'loadMaxWaitMs must release LOAD_RES even if updates arrive continuously');
+  assert.ok(releasedAt < 11, `Expected release near loadMaxWaitMs (~6 ticks), got tick ${releasedAt}`);
+});
+
+// Regression 11: session/close and bridge.close cancel pending load and deferred metadata timers cleanly.
+await scenario(async ({ bridge, emitted }) => {
+  bridge.loadSettleMs = 25;
+  bridge.loadMetaFlushDelayMs = 10;
+  bridge.loadMaxWaitMs = 200;
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 106, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  assert.equal(await bridge.fromAgent({ jsonrpc: '2.0', id: 106, result: { sessionId: id } }), null);
+  assert.equal(
+    await bridge.fromAgent({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: id, update: { sessionUpdate: 'usage_update', used: 10, size: 100 } },
+    }),
+    null,
+  );
+  await bridge.fromClient({ jsonrpc: '2.0', id: 107, method: 'session/close', params: { sessionId: id } });
+  await delay(60);
+  assert.equal(emitted.length, 0, 'session/close must cancel held LOAD_RES and deferred metadata');
+
+  await bridge.fromClient({ jsonrpc: '2.0', id: 108, method: 'session/load', params: { sessionId: id, cwd: '/tmp' } });
+  assert.equal(await bridge.fromAgent({ jsonrpc: '2.0', id: 108, result: { sessionId: id } }), null);
+  bridge.close();
+  await delay(60);
+  assert.equal(emitted.length, 0, 'bridge.close() must cancel held LOAD_RES');
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));
