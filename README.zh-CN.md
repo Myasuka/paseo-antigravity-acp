@@ -24,9 +24,10 @@
 - Antigravity 的后台唤醒（异步命令、原生子 Agent 与 `/swarm` Worker）在后台独立运行，不经过前台 ACP 权限回调。
 - 切换到 **Full access** 时，插件会在空闲态自动携带会话持久化信息重启底层 `agy acp` 并开启 `--dangerously-skip-permissions`；切出 **Full access** 时立即销毁提权进程并恢复标准审批模式。
 
-### 3. 逐模型独立思维档位与原生工具卡片
+### 3. 逐模型独立思维档位、原生工具卡片与历史时间戳恢复
 - 目录发现阶段自动探测每个模型支持的 `thought_level` 档位（如 `low` / `medium` / `high` / `xhigh`，不支持思维档位的模型自动隐藏选择器）。
 - 将 `run_command`、`read_file`、`edit_file`、`write_file`、`grep_search`、`find_by_name`、`search_web`、`read_url_content`、`invoke_subagent`、`manage_subagents`、`send_message` 以及 Swarm 工具（`swarm`、`post_message`、`read_board`、`swarm_wait`）映射为结构化 Paseo 工具详情卡片，并修正命令失败时的工具错误状态展示。
+- 在关闭后重开会话（`session/load`）重放历史消息时，自动从本地 Antigravity transcript 读取真实消息与工具完成时间戳注入 `timeline.item.timestamp`，完整保留每轮真实耗时与完成时间点。
 
 ### 4. 后台任务与原生 `/swarm` 自动排空接续
 - 解决 `agy acp` 在后台异步 `run_command`、`invoke_subagent` 或 `/swarm` Worker 尚未结束时提前返回 `end_turn` 导致消息断流的问题。

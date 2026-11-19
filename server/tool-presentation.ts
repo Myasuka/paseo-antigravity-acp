@@ -8,11 +8,13 @@ import {
 } from '@getpaseo/plugin/server/acp';
 import type {
   ProviderConnection,
+  ProviderPersistence,
   ProviderRegistration,
   ProviderToolCallDetail,
 } from '@getpaseo/plugin/server/provider';
 import { DEFAULT_READ_ONLY_ROOTS } from '../shared/settings.ts';
 import { createAgyBridgeStream } from './bridge-connector.mjs';
+import { loadHistoryTimestampMatcher, type HistoryTimestampMatcher } from './history-timestamps.mjs';
 import { withNativeFullAccess } from './native-full-access.ts';
 import { resolveAgyBinary } from './resolve-agy.mjs';
 
@@ -36,6 +38,12 @@ export interface DetailedAgyProviderOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readNativeSessionId(persistence?: ProviderPersistence): string | undefined {
+  if (!isRecord(persistence?.data)) return undefined;
+  const sessionId = persistence.data.sessionId;
+  return typeof sessionId === 'string' && sessionId ? sessionId : undefined;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -274,6 +282,8 @@ export function createDetailedAgyProvider(
     },
     async connect(request) {
       const details = new Map<string, Map<string, ProviderToolCallDetail>>();
+      const replayTimestamps = new Map<string, HistoryTimestampMatcher>();
+      const openRequests = new Map<string, string>();
       const runtimeEnv = (await extra.resolveRuntimeEnv?.()) ?? {};
       const pendingSessionEnvs: Record<string, string>[] = [];
 
@@ -387,23 +397,75 @@ export function createDetailedAgyProvider(
         async send(input) {
           if (input.type === 'session.open') {
             const freshEnv = (await extra.resolveRuntimeEnv?.()) ?? {};
-            return connection.send({
-              ...input,
-              config: {
-                ...input.config,
-                env: { ...freshEnv, ...input.config.env },
-              },
-            });
+            const mergedConfigEnv = { ...freshEnv, ...input.config.env };
+            replayTimestamps.delete(input.sessionId);
+            openRequests.delete(input.requestId);
+            if (input.history === 'replay') {
+              const nativeSessionId = readNativeSessionId(input.persistence);
+              if (nativeSessionId) {
+                const lookupEnv = {
+                  ...process.env,
+                  ...(request.launch?.env ?? {}),
+                  ...mergedConfigEnv,
+                } as Record<string, string>;
+                const matcher = await loadHistoryTimestampMatcher({
+                  nativeSessionId,
+                  env: lookupEnv,
+                }).catch(() => null);
+                if (matcher) {
+                  replayTimestamps.set(input.sessionId, matcher);
+                  openRequests.set(input.requestId, input.sessionId);
+                }
+              }
+            }
+            try {
+              return await connection.send({
+                ...input,
+                config: {
+                  ...input.config,
+                  env: mergedConfigEnv,
+                },
+              });
+            } catch (error) {
+              replayTimestamps.delete(input.sessionId);
+              openRequests.delete(input.requestId);
+              throw error;
+            }
           }
           return connection.send(input);
         },
         onEvent(listener) {
           return connection.onEvent(event => {
-            if (event.type === 'timeline.item' && event.item.type === 'tool_call') {
-              const detail = details.get(event.sessionId)?.get(event.item.id);
-              if (detail) {
-                listener({ ...event, item: { ...event.item, detail } });
+            if (event.type === 'timeline.item') {
+              const detail =
+                event.item.type === 'tool_call' ? details.get(event.sessionId)?.get(event.item.id) : undefined;
+              const item =
+                event.item.type === 'tool_call' && detail ? { ...event.item, detail } : event.item;
+              const timestamp = event.timestamp ?? replayTimestamps.get(event.sessionId)?.match(item);
+              if (item !== event.item || (timestamp && !event.timestamp)) {
+                listener({
+                  ...event,
+                  item,
+                  ...(timestamp && !event.timestamp ? { timestamp } : {}),
+                });
                 return;
+              }
+            }
+            if (
+              event.type === 'session.opened' ||
+              event.type === 'session.ready' ||
+              event.type === 'session.closed' ||
+              event.type === 'session.runtime_failed'
+            ) {
+              replayTimestamps.delete(event.sessionId);
+              if ('requestId' in event && typeof event.requestId === 'string') {
+                openRequests.delete(event.requestId);
+              }
+            } else if (event.type === 'request.failed') {
+              const failedSessionId = openRequests.get(event.requestId);
+              if (failedSessionId) {
+                replayTimestamps.delete(failedSessionId);
+                openRequests.delete(event.requestId);
               }
             }
             if (
@@ -422,6 +484,8 @@ export function createDetailedAgyProvider(
             await connection.close();
           } finally {
             details.clear();
+            replayTimestamps.clear();
+            openRequests.clear();
           }
         },
       };

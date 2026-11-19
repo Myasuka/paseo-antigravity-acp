@@ -24,9 +24,10 @@ A standalone [Paseo](https://github.com/getpaseo/paseo) plugin (`>=0.15.4`) that
 - Antigravity's autonomous background wakeups (background tasks, `invoke_subagent`, and `/swarm` workers) run outside the foreground ACP permission callback.
 - Entering **Full access** reopens the idle `agy acp` session with `--dangerously-skip-permissions` while preserving conversation persistence; leaving **Full access** immediately terminates the elevated driver and reopens in standard approval mode.
 
-### 3. Per-Model Thinking Options & Rich Tool Cards
+### 3. Per-Model Thinking Options, Rich Tool Cards & History Timestamps
 - Automatically probes each model's `thought_level` options during catalog discovery (`low` / `medium` / `high` / `xhigh`, or hides the selector on models without thinking levels).
 - Maps Antigravity tool calls (`run_command`, `read_file`, `edit_file`, `write_file`, `grep_search`, `find_by_name`, `search_web`, `read_url_content`, `invoke_subagent`, `manage_subagents`, `send_message`, `swarm`, `post_message`, `read_board`, `swarm_wait`) into native Paseo tool detail cards, and marks failed tool outputs accurately even when ACP reports `completed`.
+- Restores original message and tool completion timestamps from local Antigravity transcripts when reopening closed sessions via `session/load`, preserving accurate turn durations and end times.
 
 ### 4. Background & Native `/swarm` Turn Continuation
 - Bridges the gap when `agy acp` returns `end_turn` before asynchronous `run_command` tasks, `invoke_subagent` runs, or native `/swarm` workers finish.
