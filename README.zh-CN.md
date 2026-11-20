@@ -32,7 +32,7 @@
 ### 4. 后台任务与原生 `/swarm` 自动排空接续
 - 解决 `agy acp` 在后台异步 `run_command`、`invoke_subagent` 或 `/swarm` Worker 尚未结束时提前返回 `end_turn` 导致消息断流的问题。
 - 实时追踪 `.system_generated/logs/transcript.jsonl` 与 `.system_generated/swarm/{members.json,board.jsonl}`：只要仍有非观察类任务型 Worker 处于运行态或存在未消费的留言板唤醒，自动保持 Paseo 回合在线并流式补发后续工具状态、回复正文与增量 Token 统计。
-- 自动忽略仅处于驻留监听态的观察角色（`narrator`、`monitor`），防止正常收尾后死锁；在非 Full access 模式下若后台 Worker 因无法弹出审批而卡住，会在超时后给出清晰诊断提示。
+- 自动忽略仅处于驻留监听态的观察角色（`narrator`、`monitor`），并自动识别长时间无进展的僵死或孤儿 Worker，防止残留 Swarm 状态劫持无关后续对话或在 `Full access` 模式下死锁 `end_turn`；在非 Full access 模式下若后台 Worker 因无法弹出审批而卡住，会在超时后给出清晰诊断提示。
 
 ### 5. Paseo 内置 Swarm 实时可视化看板
 - 提供会话右侧 **Swarm 看板** 面板、Antigravity 会话专属 **Swarm** 输入框动态胶囊、Command Center 快捷动作与 `/swarm-board` 斜杠命令。

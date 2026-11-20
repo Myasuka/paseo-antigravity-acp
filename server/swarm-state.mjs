@@ -14,6 +14,8 @@ export const APPROVAL_SENSITIVE_TOOLS = new Set([
 
 export const SWARM_TOOLS = new Set(['swarm', 'post_message', 'read_board', 'swarm_wait']);
 
+export const DEFAULT_SWARM_WORKER_STALE_MS = 10 * 60 * 1000;
+
 export function isObserverMember(name, member) {
   if (typeof name === 'string' && /^(?:narrator|monitor)(?:-\d+)?$/i.test(name)) return true;
   const role = typeof member?.role === 'string' ? member.role.trim().toLowerCase() : '';
@@ -141,11 +143,21 @@ function classifyErrorKind(message) {
 }
 
 function parseStepTimeMs(row) {
+  let latest = null;
   if (typeof row?.created_at === 'string') {
     const parsed = Date.parse(row.created_at);
-    if (Number.isFinite(parsed)) return parsed;
+    if (Number.isFinite(parsed)) latest = parsed;
   }
-  return null;
+  if (typeof row?.content === 'string') {
+    const match = /^Completed At:\s*(\d{4}-\d{2}-\d{2}T[^\s]+)/m.exec(row.content);
+    if (match) {
+      const completed = Date.parse(match[1]);
+      if (Number.isFinite(completed) && (latest === null || completed > latest)) {
+        latest = completed;
+      }
+    }
+  }
+  return latest;
 }
 
 export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now()) {
@@ -380,15 +392,24 @@ export function resolveEffectiveMemberStatus(name, member, transcriptSummary, ha
   return 'working';
 }
 
-export async function readBoundedJson(filePath, maxBytes = 64 * 1024) {
+async function readBoundedJsonWithStat(filePath, maxBytes = 64 * 1024) {
   try {
     const info = await stat(filePath);
     if (!info.isFile() || info.size === 0 || info.size > maxBytes) return null;
     const raw = await readFile(filePath, 'utf8');
-    return JSON.parse(raw);
+    return {
+      data: JSON.parse(raw),
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+    };
   } catch {
     return null;
   }
+}
+
+export async function readBoundedJson(filePath, maxBytes = 64 * 1024) {
+  const loaded = await readBoundedJsonWithStat(filePath, maxBytes);
+  return loaded ? loaded.data : null;
 }
 
 export async function readBoardMessages(boardPath, maxBytes = 2 * 1024 * 1024) {
@@ -466,14 +487,28 @@ export async function inspectSwarmContinuation({
   sessionId,
   nowMs = Date.now(),
   wakeupGraceMs = 15000,
+  workerStaleMs = DEFAULT_SWARM_WORKER_STALE_MS,
+  observedWorkers = null,
 }) {
+  const emptyState = {
+    exists: false,
+    active: false,
+    activeWorkerConversations: [],
+    staleWorkerConversations: [],
+    hasWorkingTaskWorkers: false,
+    hasPendingWakeup: false,
+    awaitingApproval: false,
+    workingWorkers: [],
+    signature: null,
+  };
   if (!UUID_RE.test(sessionId ?? '')) {
-    return { exists: false, active: false, activeWorkerConversations: [], awaitingApproval: false };
+    return emptyState;
   }
   const swarmDir = join(dataDir, 'brain', sessionId, '.system_generated', 'swarm');
-  const membersDoc = await readBoundedJson(join(swarmDir, 'members.json'), 256 * 1024);
+  const membersFile = await readBoundedJsonWithStat(join(swarmDir, 'members.json'), 256 * 1024);
+  const membersDoc = membersFile?.data;
   if (!membersDoc || typeof membersDoc !== 'object' || !membersDoc.members || typeof membersDoc.members !== 'object') {
-    return { exists: false, active: false, activeWorkerConversations: [], awaitingApproval: false };
+    return emptyState;
   }
 
   const entries = Object.entries(membersDoc.members).filter(([, m]) => m && typeof m === 'object');
@@ -509,6 +544,9 @@ export async function inspectSwarmContinuation({
   };
 
   const activeWorkerConversations = [];
+  const staleWorkerKeys = [];
+  const workingWorkers = [];
+  const workerSignatureParts = [];
   let hasPendingWakeup = false;
   let awaitingApproval = false;
 
@@ -530,6 +568,7 @@ export async function inspectSwarmContinuation({
     }
 
     const convId = typeof member.conversation_id === 'string' ? member.conversation_id.toLowerCase() : '';
+    const workerKey = UUID_RE.test(convId) ? convId : `swarm:${name}`;
     const transcriptSummary = UUID_RE.test(convId)
       ? await summarizeMemberTranscript(join(dataDir, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl'), nowMs)
       : {
@@ -546,16 +585,78 @@ export async function inspectSwarmContinuation({
           awaitingApproval: false,
         };
 
+    const progressKey = transcriptSummary.exists
+      ? `${transcriptSummary.steps}:${transcriptSummary.size}:${Math.round(transcriptSummary.mtimeMs)}`
+      : 'missing';
+    workerSignatureParts.push(`${workerKey}:${progressKey}`);
+
     const pendingForMember = board.messages.some(
       post => isUnservicedRecentWakeup(post, transcriptSummary) && postWakesMember(post, name, member, rosterNames),
     );
     const status = resolveEffectiveMemberStatus(name, member, transcriptSummary, pendingForMember);
-    if (status === 'working') {
+    if (status !== 'working') {
+      if (observedWorkers instanceof Map) observedWorkers.delete(workerKey);
+      if (pendingForMember) hasPendingWakeup = true;
+      continue;
+    }
+
+    let lastActivityMs = null;
+    if (transcriptSummary.exists && Number.isFinite(transcriptSummary.lastProgressMs)) {
+      lastActivityMs = transcriptSummary.lastProgressMs;
+    } else {
+      for (const post of board.messages) {
+        if (!postWakesMember(post, name, member, rosterNames)) continue;
+        const refMs = getPostRefMs(post);
+        if (Number.isFinite(refMs) && (lastActivityMs === null || refMs > lastActivityMs)) {
+          lastActivityMs = refMs;
+        }
+      }
+      if (lastActivityMs === null && Number.isFinite(membersFile.mtimeMs)) {
+        lastActivityMs = membersFile.mtimeMs;
+      }
+    }
+
+    let effectiveLastActivityMs = lastActivityMs;
+    if (observedWorkers instanceof Map) {
+      const prev = observedWorkers.get(workerKey);
+      if (!prev) {
+        const baselineMs = Number.isFinite(lastActivityMs) ? lastActivityMs : nowMs;
+        observedWorkers.set(workerKey, { progressKey, observedAtMs: baselineMs });
+        effectiveLastActivityMs = baselineMs;
+      } else if (prev.progressKey !== progressKey) {
+        observedWorkers.set(workerKey, { progressKey, observedAtMs: nowMs });
+        effectiveLastActivityMs = Number.isFinite(lastActivityMs) ? Math.max(lastActivityMs, nowMs) : nowMs;
+      } else {
+        effectiveLastActivityMs = Number.isFinite(prev.observedAtMs)
+          ? Number.isFinite(lastActivityMs)
+            ? Math.max(lastActivityMs, prev.observedAtMs)
+            : prev.observedAtMs
+          : lastActivityMs;
+      }
+    }
+
+    const isStale =
+      !pendingForMember &&
+      workerStaleMs > 0 &&
+      Number.isFinite(effectiveLastActivityMs) &&
+      nowMs - effectiveLastActivityMs >= workerStaleMs;
+
+    workingWorkers.push({
+      name,
+      conversationId: UUID_RE.test(convId) ? convId : null,
+      key: workerKey,
+      progressKey,
+      lastActivityMs: Number.isFinite(effectiveLastActivityMs) ? effectiveLastActivityMs : null,
+      awaitingApproval: Boolean(transcriptSummary.awaitingApproval),
+      pendingWakeup: pendingForMember,
+      stale: isStale,
+    });
+
+    if (isStale) {
+      staleWorkerKeys.push(workerKey);
+    } else {
       if (transcriptSummary.awaitingApproval) awaitingApproval = true;
-      if (UUID_RE.test(convId)) activeWorkerConversations.push(convId);
-      else activeWorkerConversations.push(`swarm:${name}`);
-    } else if (pendingForMember) {
-      hasPendingWakeup = true;
+      activeWorkerConversations.push(workerKey);
     }
   }
 
@@ -577,11 +678,22 @@ export async function inspectSwarmContinuation({
     }
   }
 
+  const boardHeadSeq = board.messages.at(-1)?.seq ?? 0;
+  const signature = [
+    `m:${Math.round(membersFile.mtimeMs)}:${membersFile.size}`,
+    `b:${boardHeadSeq}:${Math.round(board.mtimeMs)}:${board.size}`,
+    ...workerSignatureParts.sort(),
+  ].join('|');
+
   return {
     exists: true,
     active: activeWorkerConversations.length > 0 || hasPendingWakeup,
     activeWorkerConversations: activeWorkerConversations.filter(id => UUID_RE.test(id)),
+    staleWorkerConversations: staleWorkerKeys.filter(id => UUID_RE.test(id)),
     hasWorkingTaskWorkers: activeWorkerConversations.length > 0,
+    hasPendingWakeup,
     awaitingApproval,
+    workingWorkers,
+    signature,
   };
 }

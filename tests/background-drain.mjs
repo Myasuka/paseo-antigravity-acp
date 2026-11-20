@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, appendFile, rm, rename } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, rm, rename, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BackgroundDrain } from '../server/background-drain.mjs';
@@ -1164,6 +1164,410 @@ await scenario(async ({ bridge, emitted }) => {
   bridge.close();
   await delay(60);
   assert.equal(emitted.length, 0, 'bridge.close() must cancel held LOAD_RES');
+});
+
+// Swarm Case 5: Exact production repro (nativeFull: true, pre-existing 2h-stale worker mid-write_file/run_command) releases unrelated end_turn immediately.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.timeoutMs = 1000;
+  const twoHoursAgoMs = Date.now() - 2 * 60 * 60 * 1000;
+  const twoHoursAgoIso = new Date(twoHoursAgoMs).toISOString();
+  const swarmDir = await setupSwarm(root, {
+    members: {
+      'stg-ops': {
+        conversation_id: workerConv,
+        role: 'worker',
+        phase: 'RUNNING',
+        wake_mode: 'working',
+        last_read_seq: 1,
+        killed: false,
+      },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@stg-ops verify stg', time: twoHoursAgoIso }],
+  });
+  await utimes(join(swarmDir, 'members.json'), new Date(twoHoursAgoMs), new Date(twoHoursAgoMs));
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: twoHoursAgoIso, content: 'verify stg' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: twoHoursAgoIso,
+      tool_calls: [
+        { name: 'write_file', args: { Path: '"/tmp/probe.py"' } },
+        { name: 'run_command', args: { CommandLine: '"python3 /tmp/probe.py"' } },
+      ],
+    },
+  ]);
+  const workerTranscriptPath = join(root, 'brain', workerConv, '.system_generated/logs/transcript.jsonl');
+  await utimes(workerTranscriptPath, new Date(twoHoursAgoMs), new Date(twoHoursAgoMs));
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'Can we start testing now?' },
+    message(1, 'QUICK_REPLY'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'QUICK_REPLY' } } },
+  });
+  const res = await bridge.fromAgent(response);
+  assert.equal(res.result.stopReason, 'end_turn');
+  assert.equal(emitted.length, 0);
+});
+
+// Swarm Case 6: Same 2h-stale worker repro in default mode (nativeFull: false) releases cleanly without false ACP approval error.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  bridge.nativeFull = false;
+  bridge.approvalStallMs = 20;
+  const twoHoursAgoMs = Date.now() - 2 * 60 * 60 * 1000;
+  const twoHoursAgoIso = new Date(twoHoursAgoMs).toISOString();
+  await setupSwarm(root, {
+    members: {
+      'stg-ops': {
+        conversation_id: workerConv,
+        role: 'worker',
+        phase: 'RUNNING',
+        wake_mode: 'working',
+        last_read_seq: 1,
+        killed: false,
+      },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@stg-ops verify stg', time: twoHoursAgoIso }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: twoHoursAgoIso, content: 'verify stg' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: twoHoursAgoIso,
+      tool_calls: [
+        { name: 'write_file', args: { Path: '"/tmp/probe.py"' } },
+        { name: 'run_command', args: { CommandLine: '"python3 /tmp/probe.py"' } },
+      ],
+    },
+  ]);
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'unrelated question' },
+    message(1, 'NO_FALSE_APPROVAL_ERROR'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'NO_FALSE_APPROVAL_ERROR' } } },
+  });
+  const res = await bridge.fromAgent(response);
+  assert.equal(res.result.stopReason, 'end_turn');
+  assert.equal(emitted.length, 0);
+});
+
+// Swarm Case 7: Coordinator invoking swarm{action:"status"} (seenSwarm: true) still releases immediately when the only working worker is 2h stale.
+await scenario(async ({ root, bridge, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.timeoutMs = 1000;
+  const twoHoursAgoIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  await setupSwarm(root, {
+    members: {
+      'stg-ops': {
+        conversation_id: workerConv,
+        role: 'worker',
+        phase: 'RUNNING',
+        wake_mode: 'working',
+        last_read_seq: 1,
+        killed: false,
+      },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@stg-ops verify', time: twoHoursAgoIso }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: twoHoursAgoIso, content: 'verify' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: twoHoursAgoIso,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"python3 probe.py"' } }],
+    },
+  ]);
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'check swarm status' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'swarm', args: { action: '"status"' } }],
+    },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'stg-ops: working' },
+    message(3, 'STATUS_CHECKED'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'tool_call', toolCallId: 'sw-status-1', name: 'swarm', status: 'completed', rawInput: { action: 'status' } },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STATUS_CHECKED' } } },
+  });
+  const res = await bridge.fromAgent(response);
+  assert.equal(res.result.stopReason, 'end_turn');
+});
+
+// Swarm Case 8: Pre-existing unchanged worker aged between preExistingSwarmWorkerStaleMs (2m) and swarmWorkerStaleMs (10m)
+// releases unrelated turns immediately, whereas if it progresses during the turn it holds until settled.
+await scenario(async ({ root, bridge, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.timeoutMs = 1000;
+  const threeMinAgoMs = Date.now() - 3 * 60 * 1000;
+  const threeMinAgoIso = new Date(threeMinAgoMs).toISOString();
+  await setupSwarm(root, {
+    members: {
+      impl: {
+        conversation_id: workerConv,
+        role: 'worker',
+        phase: 'RUNNING',
+        wake_mode: 'mentions',
+        last_read_seq: 1,
+        killed: false,
+      },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl work', time: threeMinAgoIso }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: threeMinAgoIso, content: 'work' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: threeMinAgoIso,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"sleep 10"' } }],
+    },
+  ]);
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'unrelated question' },
+    message(1, 'UNRELATED_OK'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'UNRELATED_OK' } } },
+  });
+  assert.equal((await bridge.fromAgent(response)).result.stopReason, 'end_turn');
+});
+
+await scenario(async ({ root, bridge, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.timeoutMs = 1000;
+  const threeMinAgoMs = Date.now() - 3 * 60 * 1000;
+  const threeMinAgoIso = new Date(threeMinAgoMs).toISOString();
+  await setupSwarm(root, {
+    members: {
+      impl: {
+        conversation_id: workerConv,
+        role: 'worker',
+        phase: 'RUNNING',
+        wake_mode: 'mentions',
+        last_read_seq: 1,
+        killed: false,
+      },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl work', time: threeMinAgoIso }],
+  });
+  const initialRows = [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: threeMinAgoIso, content: 'work' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: threeMinAgoIso,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"sleep 10"' } }],
+    },
+  ];
+  await writeMemberTranscript(root, workerConv, initialRows);
+
+  await begin();
+  // Worker emits new progress during this turn -> signature & progressKey change -> must hold until settled!
+  await writeMemberTranscript(root, workerConv, [
+    ...initialRows,
+    { step_index: 2, type: 'GENERIC', status: 'DONE', created_at: new Date().toISOString(), content: 'step finished' },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date().toISOString(),
+      tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/next"' } }],
+    },
+  ]);
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'unrelated question' },
+    message(1, 'QUICK_MSG'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'QUICK_MSG' } } },
+  });
+  let settled = false;
+  const done = bridge.fromAgent(response).then(r => {
+    settled = true;
+    return r;
+  });
+  await delay(25);
+  assert.equal(settled, false, 'Must hold turn once pre-existing worker resumes making progress');
+
+  await writeMemberTranscript(root, workerConv, [
+    ...initialRows,
+    { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), content: 'Worker done' },
+  ]);
+  assert.equal((await done).result.stopReason, 'end_turn');
+});
+
+// Swarm Case 9: Active Swarm worker stalling mid-turn in full-access mode stays held initially and releases after swarmWorkerStaleMs + settleMs.
+await scenario(async ({ root, bridge, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.swarmWorkerStaleMs = 50;
+  bridge.timeoutMs = 2000;
+  bridge.settleMs = 10;
+
+  await begin();
+  await setupSwarm(root, {
+    members: {
+      impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl start', time: '2026-01-01T00:00:00.000Z' }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'start' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date().toISOString(),
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"hang-forever"' } }],
+    },
+  ]);
+
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'run swarm' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm', args: { action: '"add"', name: '"impl"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Spawned' },
+    message(3, 'STARTED'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'tool_call', toolCallId: 'sw-stall-1', name: 'swarm', status: 'completed', rawInput: { action: 'add', name: 'impl' } },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STARTED' } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(r => {
+    settled = true;
+    return r;
+  });
+  await delay(20);
+  assert.equal(settled, false, 'Must remain held before swarmWorkerStaleMs elapses');
+  const res = await done;
+  assert.equal(res.result.stopReason, 'end_turn');
+});
+
+// Swarm Case 10: Active Swarm worker advancing every 25ms past swarmWorkerStaleMs (80ms) stays held until finished.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.swarmWorkerStaleMs = 80;
+  bridge.timeoutMs = 2000;
+  bridge.settleMs = 10;
+
+  await begin();
+  await setupSwarm(root, {
+    members: {
+      impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl build', time: '2026-01-01T00:00:00.000Z' }],
+  });
+  const rows = [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'build' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date().toISOString(),
+      tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/0"' } }],
+    },
+  ];
+  await writeMemberTranscript(root, workerConv, rows);
+
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'run long active swarm' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm', args: { action: '"add"', name: '"impl"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Spawned' },
+    message(3, 'STARTED'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'tool_call', toolCallId: 'sw-active-1', name: 'swarm', status: 'completed', rawInput: { action: 'add', name: 'impl' } },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STARTED' } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(r => {
+    settled = true;
+    return r;
+  });
+
+  for (let i = 1; i <= 4; i++) {
+    await delay(25);
+    assert.equal(settled, false, `Must stay held while worker advances (tick ${i})`);
+    rows.push(
+      { step_index: i * 2, type: 'GENERIC', status: 'DONE', created_at: new Date().toISOString(), content: `ok-${i}` },
+      {
+        step_index: i * 2 + 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date().toISOString(),
+        tool_calls: [{ name: 'read_file', args: { Path: `"/tmp/${i}"` } }],
+      },
+    );
+    await writeMemberTranscript(root, workerConv, rows);
+  }
+  assert.equal(settled, false, 'Still held past swarmWorkerStaleMs because progressKey kept advancing');
+
+  rows.push(
+    { step_index: 10, type: 'GENERIC', status: 'DONE', created_at: new Date().toISOString(), content: 'ok-final' },
+    { step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), content: 'Worker complete' },
+  );
+  await writeMemberTranscript(root, workerConv, rows);
+  await appendFile(
+    join(root, 'brain', id, '.system_generated/swarm/board.jsonl'),
+    JSON.stringify({ seq: 2, agent: 'impl', channel: 'main', text: '@coordinator [done] Complete', time: new Date().toISOString() }) + '\n',
+  );
+  await append([
+    { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>Board wakeup #2 from @impl</SYSTEM_MESSAGE>' },
+    message(5, 'ACTIVE_PROGRESS_SYNTHESIS'),
+  ]);
+
+  const res = await done;
+  assert.equal(res.result.stopReason, 'end_turn');
+  assert.ok(
+    emitted.some(e => e.params?.update?.sessionUpdate === 'agent_message_chunk' && e.params.update.content?.text === 'ACTIVE_PROGRESS_SYNTHESIS'),
+  );
 });
 
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

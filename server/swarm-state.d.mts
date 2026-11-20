@@ -1,6 +1,7 @@
 export const UUID_RE: RegExp;
 export const APPROVAL_SENSITIVE_TOOLS: ReadonlySet<string>;
 export const SWARM_TOOLS: ReadonlySet<string>;
+export const DEFAULT_SWARM_WORKER_STALE_MS: number;
 
 export interface RawSwarmMember {
   conversation_id?: string;
@@ -44,12 +45,32 @@ export interface MemberTranscriptSummary {
   awaitingApproval: boolean;
 }
 
+export interface ObservedSwarmWorkerProgress {
+  progressKey: string;
+  observedAtMs: number | null;
+}
+
+export interface SwarmWorkingWorkerState {
+  name: string;
+  conversationId: string | null;
+  key: string;
+  progressKey: string;
+  lastActivityMs: number | null;
+  awaitingApproval: boolean;
+  pendingWakeup: boolean;
+  stale: boolean;
+}
+
 export interface SwarmContinuationState {
   exists: boolean;
   active: boolean;
   activeWorkerConversations: string[];
+  staleWorkerConversations?: string[];
   hasWorkingTaskWorkers?: boolean;
+  hasPendingWakeup?: boolean;
   awaitingApproval?: boolean;
+  workingWorkers?: SwarmWorkingWorkerState[];
+  signature?: string | null;
 }
 
 export function isObserverMember(name: string, member?: RawSwarmMember | null): boolean;
@@ -81,4 +102,6 @@ export function inspectSwarmContinuation(options: {
   sessionId: string;
   nowMs?: number;
   wakeupGraceMs?: number;
+  workerStaleMs?: number;
+  observedWorkers?: Map<string, ObservedSwarmWorkerProgress> | null;
 }): Promise<SwarmContinuationState>;

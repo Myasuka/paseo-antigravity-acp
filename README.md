@@ -32,7 +32,7 @@ A standalone [Paseo](https://github.com/getpaseo/paseo) plugin (`>=0.15.4`) that
 ### 4. Background & Native `/swarm` Turn Continuation
 - Bridges the gap when `agy acp` returns `end_turn` before asynchronous `run_command` tasks, `invoke_subagent` runs, or native `/swarm` workers finish.
 - Tails `.system_generated/logs/transcript.jsonl` and `.system_generated/swarm/{members.json,board.jsonl}` to keep the Paseo turn active while task workers are working or coordinator board wakeups are pending, streaming follow-up tool calls, messages, and token usage back to Paseo.
-- Excludes observer-only Swarm roles (`narrator`, `monitor`) from blocking turn completion once all task workers settle, and surfaces clear timeout diagnostics if a non-`Full access` background worker stalls on an unroutable native approval.
+- Excludes observer-only Swarm roles (`narrator`, `monitor`) from blocking turn completion once all task workers settle, treats stale or orphaned Swarm workers with prolonged zero progress as inactive so dead workers never hijack unrelated follow-up turns or hang `end_turn` in `Full access` mode, and surfaces clear timeout diagnostics if a non-`Full access` background worker stalls on an unroutable native approval.
 
 ### 5. Live Paseo Swarm Board Visualizer
 - Adds an **Antigravity Swarm Board** agent panel, a live **Swarm** composer pill on Antigravity sessions, a Command Center action, and the `/swarm-board` slash command.

@@ -2,7 +2,12 @@ import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { TranscriptTail, BackgroundProjection, signature } from './background-transcript.mjs';
-import { APPROVAL_SENSITIVE_TOOLS, UUID_RE, inspectSwarmContinuation } from './swarm-state.mjs';
+import {
+  APPROVAL_SENSITIVE_TOOLS,
+  DEFAULT_SWARM_WORKER_STALE_MS,
+  UUID_RE,
+  inspectSwarmContinuation,
+} from './swarm-state.mjs';
 
 const STALE_PASS_THROUGH_UPDATES = new Set([
   'available_commands_update',
@@ -80,6 +85,8 @@ export class BackgroundDrain {
     approvalStallMs = 30000,
     subagentFailureGraceMs = 5000,
     swarmWakeupGraceMs = 15000,
+    swarmWorkerStaleMs = DEFAULT_SWARM_WORKER_STALE_MS,
+    preExistingSwarmWorkerStaleMs = 2 * 60 * 1000,
     nativeFull = process.env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
     loadSettleMs = 400,
     loadMaxWaitMs = 15000,
@@ -102,6 +109,8 @@ export class BackgroundDrain {
     this.approvalStallMs = approvalStallMs;
     this.subagentFailureGraceMs = subagentFailureGraceMs;
     this.swarmWakeupGraceMs = swarmWakeupGraceMs;
+    this.swarmWorkerStaleMs = swarmWorkerStaleMs;
+    this.preExistingSwarmWorkerStaleMs = preExistingSwarmWorkerStaleMs;
     this.nativeFull = nativeFull;
     this.loadSettleMs = loadSettleMs;
     this.loadMaxWaitMs = loadMaxWaitMs;
@@ -419,11 +428,27 @@ export class BackgroundDrain {
         join(this.dataDir, 'brain', params.sessionId, '.system_generated/logs/transcript.jsonl'),
       );
       await tail.begin();
+      const swarmBaseline = await inspectSwarmContinuation({
+        dataDir: this.dataDir,
+        sessionId: params.sessionId,
+        wakeupGraceMs: this.swarmWakeupGraceMs,
+        workerStaleMs: this.swarmWorkerStaleMs,
+      });
       if (this.closed) throw new Error('AGY background bridge is closed');
+      if (session.round) throw new Error('AGY already has an active foreground or background turn');
+      const observedSwarmWorkers = new Map();
+      for (const worker of swarmBaseline.workingWorkers ?? []) {
+        observedSwarmWorkers.set(worker.key, {
+          progressKey: worker.progressKey,
+          observedAtMs: worker.lastActivityMs,
+        });
+      }
       session.round = {
         tail,
         projection: new BackgroundProjection(params.sessionId, this.emit),
         controller: new AbortController(),
+        swarmBaseline,
+        observedSwarmWorkers,
       };
     }
     if ('id' in message) this.requests.set(message.id, { method: message.method, sessionId: params.sessionId });
@@ -452,6 +477,36 @@ export class BackgroundDrain {
       }
     }
     return this._fromAgent(message);
+  }
+
+  isUnchangedPreExistingSwarmStale(state, round, swarmState, nowMs = Date.now()) {
+    if (!(this.preExistingSwarmWorkerStaleMs > 0)) return false;
+    if (
+      state.seenSwarm ||
+      state.seenBackground ||
+      state.hasPostForegroundWork ||
+      state.parkedOnSwarmWait ||
+      round.projection.hasOpenForegroundTools()
+    ) {
+      return false;
+    }
+    if (!swarmState?.exists || !swarmState.active || swarmState.hasPendingWakeup) return false;
+    const baseline = round?.swarmBaseline;
+    if (!baseline?.exists || !baseline.signature || baseline.signature !== swarmState.signature) {
+      return false;
+    }
+    const activeWorkers = (swarmState.workingWorkers ?? []).filter(worker => !worker.stale);
+    if (activeWorkers.length === 0) return false;
+    const baselineWorkers = new Map((baseline.workingWorkers ?? []).map(worker => [worker.key, worker]));
+    return activeWorkers.every(worker => {
+      if (worker.pendingWakeup) return false;
+      const baseWorker = baselineWorkers.get(worker.key);
+      if (!baseWorker || baseWorker.progressKey !== worker.progressKey) return false;
+      return (
+        Number.isFinite(worker.lastActivityMs) &&
+        nowMs - worker.lastActivityMs >= this.preExistingSwarmWorkerStaleMs
+      );
+    });
   }
 
   async _fromAgent(message) {
@@ -505,15 +560,21 @@ export class BackgroundDrain {
       round.projection.add(await round.tail.read());
       round.projection.flushCompletedForegroundTools();
       let state = round.projection.inspect();
+      const initialNowMs = Date.now();
       let swarmState = await inspectSwarmContinuation({
         dataDir: this.dataDir,
         sessionId: request.sessionId,
+        nowMs: initialNowMs,
         wakeupGraceMs: this.swarmWakeupGraceMs,
+        workerStaleMs: this.swarmWorkerStaleMs,
+        observedWorkers: round.observedSwarmWorkers,
       });
+      const initialSwarmActive =
+        swarmState.active && !this.isUnchangedPreExistingSwarmStale(state, round, swarmState, initialNowMs);
       if (
-        (!state.seenBackground && !swarmState.active) ||
+        (!state.seenBackground && !initialSwarmActive) ||
         (state.coordinatorSettled &&
-          !swarmState.active &&
+          !initialSwarmActive &&
           !state.hasPostForegroundWork &&
           !round.projection.hasOpenForegroundTools())
       ) {
@@ -528,11 +589,17 @@ export class BackgroundDrain {
         state = round.projection.inspect({ publish: true });
         if (state.foreignInput) return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
         if (state.failure) throw new Error(state.failure);
+        const loopNowMs = Date.now();
         swarmState = await inspectSwarmContinuation({
           dataDir: this.dataDir,
           sessionId: request.sessionId,
+          nowMs: loopNowMs,
           wakeupGraceMs: this.swarmWakeupGraceMs,
+          workerStaleMs: this.swarmWorkerStaleMs,
+          observedWorkers: round.observedSwarmWorkers,
         });
+        const effectiveSwarmActive =
+          swarmState.active && !this.isUnchangedPreExistingSwarmStale(state, round, swarmState, loopNowMs);
         const subStatus = await this.inspectActiveSubagents(state.activeSubagents);
         if (subStatus.terminalFailure) {
           subagentFailureSince ??= Date.now();
@@ -548,7 +615,7 @@ export class BackgroundDrain {
           !hasPendingAcpPermission &&
           ((state.awaitingCommandStart && state.pendingTasks === 0) ||
             subStatus.awaitingApproval ||
-            Boolean(swarmState.awaitingApproval));
+            (effectiveSwarmActive && Boolean(swarmState.awaitingApproval)));
         if (needsApprovalChannel) {
           approvalStallSince ??= Date.now();
           if (Date.now() - approvalStallSince >= this.approvalStallMs) {
@@ -559,7 +626,7 @@ export class BackgroundDrain {
         } else {
           approvalStallSince = undefined;
         }
-        if (state.coordinatorSettled && !swarmState.active) {
+        if (state.coordinatorSettled && !effectiveSwarmActive) {
           idleSince ??= Date.now();
           if (Date.now() - idleSince >= this.settleMs) {
             const result = structuredClone(message);
