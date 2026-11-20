@@ -1570,4 +1570,108 @@ await scenario(async ({ root, bridge, emitted, append, begin }) => {
   );
 });
 
+// Swarm Case 11: Exact production repro where verifier is on swarm_wait AND all task workers are waiting on
+// long-running background run_command tasks (zero-tool PLANNER_RESPONSE DONE) whose task log streams progress.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  const workerConv2 = 'ffffffff-1111-2222-3333-444444444444';
+  bridge.nativeFull = true;
+  bridge.swarmWorkerStaleMs = 70;
+  bridge.settleMs = 10;
+  bridge.timeoutMs = 3000;
+
+  await setupSwarm(root, {
+    members: {
+      'core-slim': { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, killed: false },
+      'mw-e2e-slim': { conversation_id: workerConv2, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+      verifier: { conversation_id: subA, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+      monitor: { conversation_id: monitorConv, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@core-slim @mw-e2e-slim resume', time: '2026-01-01T00:00:00.000Z' }],
+  });
+
+  await writeMemberTranscript(root, subA, [
+    { step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'standby' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: '1' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Waiting' },
+  ]);
+  await writeMemberTranscript(root, monitorConv, [
+    { step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'monitor' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_board', args: {} }] },
+  ]);
+
+  const coreRows = [
+    { step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'resume' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"go test -race ./pkg/prefixroute"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${workerConv}/task-1` },
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Running pkg/prefixroute -race in background; waiting.' },
+  ];
+  const mwRows = [
+    { step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'resume' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"go test -race ./client/middleware/..."' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${workerConv2}/task-1` },
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Running client/middleware -race in background; waiting.' },
+  ];
+  await writeMemberTranscript(root, workerConv, coreRows);
+  await writeMemberTranscript(root, workerConv2, mwRows);
+  const mwTaskDir = join(root, 'brain', workerConv2, '.system_generated/tasks');
+  await mkdir(mwTaskDir, { recursive: true });
+  const mwTaskLog = join(mwTaskDir, 'task-1.log');
+  await writeFile(mwTaskLog, '=== RUN TestInit\n');
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'resume swarm' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'swarm_wait', args: { since: '1' } }],
+    },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Waiting for board post' },
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-bg-1', name: 'swarm_wait', status: 'completed', rawInput: { since: 1 } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(r => {
+    settled = true;
+    return r;
+  });
+
+  // Even after settleMs (10ms) and past swarmWorkerStaleMs (70ms), streaming task-1.log keeps the turn open!
+  for (let i = 1; i <= 4; i++) {
+    await delay(25);
+    assert.equal(settled, false, `Must hold end_turn while worker streams background task log (tick ${i})`);
+    await appendFile(mwTaskLog, `PASS pkg/subpkg-${i}\n`);
+  }
+
+  // Both workers finish their background tasks and report @coordinator [done]
+  coreRows.push(
+    { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `<SYSTEM_MESSAGE>\ncontent=Task id "${workerConv}/task-1" finished with result:\nOK\n</SYSTEM_MESSAGE>` },
+    { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Core checks done.' },
+  );
+  mwRows.push(
+    { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `<SYSTEM_MESSAGE>\ncontent=Task id "${workerConv2}/task-1" finished with result:\nOK\n</SYSTEM_MESSAGE>` },
+    { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'MW checks done.' },
+  );
+  await writeMemberTranscript(root, workerConv, coreRows);
+  await writeMemberTranscript(root, workerConv2, mwRows);
+  await appendFile(
+    join(root, 'brain', id, '.system_generated/swarm/board.jsonl'),
+    JSON.stringify({ seq: 2, agent: 'mw-e2e-slim', channel: 'main', text: '@coordinator [done] All verified', time: new Date().toISOString() }) + '\n',
+  );
+  await append([
+    { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>Board wakeup #2</SYSTEM_MESSAGE>' },
+    message(4, 'SWARM_BG_TASKS_SYNTHESIZED'),
+  ]);
+
+  const res = await done;
+  assert.equal(res.result.stopReason, 'end_turn');
+  assert.ok(
+    emitted.some(e => e.params?.update?.sessionUpdate === 'agent_message_chunk' && e.params.update.content?.text === 'SWARM_BG_TASKS_SYNTHESIZED'),
+  );
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

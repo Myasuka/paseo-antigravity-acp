@@ -1,7 +1,29 @@
 import { open, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const BG_TASK_LAUNCH_RE = new RegExp(
+  `(?:^|\\n)Tool is running as a background task with task id: (${UUID_PATTERN}\\/task-\\d+)(?:\\s|$)`,
+  'i',
+);
+const BG_TASK_DONE_RE =
+  /content=Task id "([^"]+)" (?:finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:/g;
+const CREATED_SUBAGENT_RE = new RegExp(
+  `(?:^|\\n)Created the following subagent:\\s*\\{[\\s\\S]*?"conversationId"\\s*:\\s*"(${UUID_PATTERN})"`,
+  'i',
+);
+const DIRECT_SUBAGENT_MSG_RE = new RegExp(
+  `\\[Message\\][^\\n]*\\bsender=(${UUID_PATTERN})\\b[^\\n]*\\bcontent=([\\s\\S]*?)(?:\\n<\\/SYSTEM_MESSAGE>|$)`,
+  'gi',
+);
+const SYSTEM_SUBAGENT_IDLE_RE = new RegExp(
+  `\\bcontent=Subagent "?(${UUID_PATTERN})"? (?:has gone idle\\. This was the subagent's most recent response:[\\s\\S]*?|went idle without reporting anything back[\\s\\S]*?|has been explicitly canceled[\\s\\S]*?)(?:\\n<\\/SYSTEM_MESSAGE>|$)`,
+  'gi',
+);
+const SERVER_RESTART_NOTICE_RE =
+  /\bcontent=\[Notice\] All your subagents and background tasks have been stopped due to server restart\./;
+const STREAM_INTERRUPTED_RE = /stream was interrupted/i;
 
 export const APPROVAL_SENSITIVE_TOOLS = new Set([
   'run_command',
@@ -160,6 +182,177 @@ function parseStepTimeMs(row) {
   return latest;
 }
 
+function extractCommandHeader(content) {
+  return typeof content === 'string' ? content.split(/\nCommand output:/)[0] : '';
+}
+
+function summarizeBackgroundCommand(args, content) {
+  const toolSummary = decodeToolArgValue(args?.toolSummary);
+  if (typeof toolSummary === 'string' && toolSummary.trim()) {
+    return toolSummary.trim().slice(0, 80);
+  }
+  const cmd = decodeToolArgValue(args?.CommandLine);
+  if (typeof cmd === 'string' && cmd.trim()) {
+    return cmd.trim().replace(/\s+/g, ' ').slice(0, 80);
+  }
+  const descMatch = /^Task Description:\s*(.+)$/m.exec(extractCommandHeader(content));
+  if (descMatch?.[1]?.trim()) {
+    return descMatch[1].trim().slice(0, 80);
+  }
+  return '';
+}
+
+function summarizePendingBackgroundActivity(pendingBgTasks, pendingSubagents) {
+  if (pendingBgTasks.size > 0) {
+    let latest;
+    for (const entry of pendingBgTasks.values()) latest = entry;
+    const base = latest.summary
+      ? `run_command (${latest.taskName}): ${latest.summary}`
+      : `Waiting on background task (${latest.taskName})`;
+    const suffix = pendingBgTasks.size > 1 ? ` (+${pendingBgTasks.size - 1})` : '';
+    return `${base.slice(0, 120 - suffix.length)}${suffix}`;
+  }
+  if (pendingSubagents.size > 0) {
+    return pendingSubagents.size === 1 ? 'Waiting on subagent' : `Waiting on ${pendingSubagents.size} subagents`;
+  }
+  return null;
+}
+
+function trackPendingBackgroundWork(rows) {
+  const queue = [];
+  const pendingBgTasks = new Map();
+  const knownSubagents = new Map();
+  const pendingSubagents = new Map();
+
+  for (const row of rows) {
+    if (row.type === 'PLANNER_RESPONSE') {
+      const calls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
+      for (const call of calls) {
+        queue.push({
+          name: typeof call?.name === 'string' ? call.name : '',
+          args: call?.args && typeof call.args === 'object' ? call.args : {},
+        });
+      }
+      continue;
+    }
+
+    if (row.type === 'GENERIC' && queue.length > 0) {
+      const ref = queue.shift();
+      const content = typeof row.content === 'string' ? row.content : '';
+      const isDaemon = ref.name === 'run_command' && decodeToolArgValue(ref.args?.IsDaemon) === true;
+      const launchMatch =
+        ref.name === 'run_command' && !isDaemon
+          ? BG_TASK_LAUNCH_RE.exec(extractCommandHeader(content))
+          : null;
+      if (launchMatch) {
+        const taskId = launchMatch[1].toLowerCase();
+        const taskName = taskId.split('/')[1] || taskId;
+        pendingBgTasks.set(taskId, {
+          taskName,
+          summary: summarizeBackgroundCommand(ref.args, content),
+        });
+        continue;
+      }
+
+      if (ref.name === 'manage_task' && row.status === 'DONE') {
+        const action = decodeToolArgValue(ref.args?.Action);
+        const rawTarget = decodeToolArgValue(ref.args?.TaskId);
+        if (action === 'kill' && typeof rawTarget === 'string' && rawTarget.trim()) {
+          const target = rawTarget.trim().toLowerCase();
+          pendingBgTasks.delete(target);
+          for (const existingKey of [...pendingBgTasks.keys()]) {
+            if (existingKey.endsWith(`/${target}`)) pendingBgTasks.delete(existingKey);
+          }
+        }
+        continue;
+      }
+
+      if (ref.name === 'invoke_subagent' && row.status === 'DONE') {
+        const createdMatch = CREATED_SUBAGENT_RE.exec(content);
+        if (createdMatch) {
+          const subId = createdMatch[1].toLowerCase();
+          knownSubagents.set(subId, true);
+          pendingSubagents.set(subId, true);
+        }
+        continue;
+      }
+
+      if (ref.name === 'send_message' && row.status === 'DONE') {
+        const recipient = decodeToolArgValue(ref.args?.Recipient);
+        if (typeof recipient === 'string') {
+          const subId = recipient.trim().toLowerCase();
+          if (knownSubagents.has(subId)) pendingSubagents.set(subId, true);
+        }
+        continue;
+      }
+
+      if (ref.name === 'manage_subagents' && row.status === 'DONE' && pendingSubagents.size > 0) {
+        const action = decodeToolArgValue(ref.args?.Action);
+        if (action === 'kill_all') {
+          pendingSubagents.clear();
+        } else if (action === 'kill') {
+          const ids = decodeToolArgValue(ref.args?.ConversationIds);
+          if (Array.isArray(ids)) {
+            for (const rawId of ids) {
+              if (typeof rawId === 'string') pendingSubagents.delete(rawId.trim().toLowerCase());
+            }
+          }
+        } else if (action === 'list') {
+          if (/\b(?:no|0) active subagents?\b/i.test(content)) {
+            pendingSubagents.clear();
+          } else {
+            const listMatch = /\n(\[[\s\S]*\])\s*$/.exec(content);
+            if (listMatch) {
+              try {
+                const parsed = JSON.parse(listMatch[1]);
+                if (Array.isArray(parsed)) {
+                  const running = new Set(
+                    parsed
+                      .filter(item => item?.state === 'running' && typeof item.conversationId === 'string')
+                      .map(item => item.conversationId.toLowerCase()),
+                  );
+                  for (const subId of [...pendingSubagents.keys()]) {
+                    if (!running.has(subId)) pendingSubagents.delete(subId);
+                  }
+                }
+              } catch {}
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    if (row.type === 'SYSTEM_MESSAGE') {
+      const content = typeof row.content === 'string' ? row.content : '';
+      for (const doneMatch of content.matchAll(BG_TASK_DONE_RE)) {
+        pendingBgTasks.delete(doneMatch[1].toLowerCase());
+      }
+      for (const directMatch of content.matchAll(DIRECT_SUBAGENT_MSG_RE)) {
+        pendingSubagents.delete(directMatch[1].toLowerCase());
+      }
+      for (const idleMatch of content.matchAll(SYSTEM_SUBAGENT_IDLE_RE)) {
+        pendingSubagents.delete(idleMatch[1].toLowerCase());
+      }
+      if (SERVER_RESTART_NOTICE_RE.test(content)) {
+        pendingBgTasks.clear();
+        pendingSubagents.clear();
+      }
+      continue;
+    }
+
+    if (row.type === 'ERROR_MESSAGE') {
+      const errMsg = String(row.error || row.content || '');
+      if (row.status === 'ERROR' || STREAM_INTERRUPTED_RE.test(errMsg)) {
+        pendingBgTasks.clear();
+        pendingSubagents.clear();
+      }
+    }
+  }
+
+  return { pendingBgTasks, pendingSubagents };
+}
+
 export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now()) {
   let file;
   try {
@@ -178,9 +371,11 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastProgressMs: info.mtimeMs,
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
-    const readBytes = Math.min(info.size, 256 * 1024);
+    const readBytes = Math.min(info.size, 512 * 1024);
     const buffer = Buffer.alloc(readBytes);
     await file.read(buffer, 0, readBytes, info.size - readBytes);
     let text = buffer.toString('utf8');
@@ -214,6 +409,8 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastProgressMs: info.mtimeMs,
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
 
@@ -224,7 +421,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
     );
     const steps = maxStepIndex + 1;
     const newest = rows.at(-1);
-    const lastProgressMs = parseStepTimeMs(newest) ?? info.mtimeMs;
+    let lastProgressMs = parseStepTimeMs(newest) ?? info.mtimeMs;
 
     let failure = null;
     if (
@@ -255,11 +452,53 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
       lastTurnBoundaryIdx >= 0 ? parseStepTimeMs(rows[lastTurnBoundaryIdx]) : null;
     const hasPostInitialWakeup = lastTurnBoundaryIdx > 0;
 
-    // Terminal model/planner error stops the current run.
+    const { pendingBgTasks, pendingSubagents } = trackPendingBackgroundWork(rows);
+    const backgroundProgressParts = [];
+    if (pendingBgTasks.size > 0 || pendingSubagents.size > 0) {
+      const systemGenDir = dirname(dirname(transcriptPath));
+      for (const taskInfo of pendingBgTasks.values()) {
+        try {
+          const taskStat = await stat(join(systemGenDir, 'tasks', `${taskInfo.taskName}.log`));
+          backgroundProgressParts.push(`t:${taskInfo.taskName}:${taskStat.size}:${Math.round(taskStat.mtimeMs)}`);
+          if (
+            Number.isFinite(taskStat.mtimeMs) &&
+            taskStat.mtimeMs <= nowMs + 60_000 &&
+            taskStat.mtimeMs > lastProgressMs
+          ) {
+            lastProgressMs = taskStat.mtimeMs;
+          }
+        } catch {}
+      }
+      if (pendingSubagents.size > 0 && basename(systemGenDir) === '.system_generated') {
+        const brainDir = dirname(dirname(systemGenDir));
+        for (const subId of pendingSubagents.keys()) {
+          try {
+            const subStat = await stat(join(brainDir, subId, '.system_generated', 'logs', 'transcript.jsonl'));
+            backgroundProgressParts.push(`s:${subId}:${subStat.size}:${Math.round(subStat.mtimeMs)}`);
+            if (
+              Number.isFinite(subStat.mtimeMs) &&
+              subStat.mtimeMs <= nowMs + 60_000 &&
+              subStat.mtimeMs > lastProgressMs
+            ) {
+              lastProgressMs = subStat.mtimeMs;
+            }
+          } catch {}
+        }
+      }
+    }
+    const pendingBackgroundCount = pendingBgTasks.size + pendingSubagents.size;
+    const backgroundProgressKey = backgroundProgressParts.sort().join(',');
+
+    const isStreamInterrupted =
+      newest?.type === 'ERROR_MESSAGE' &&
+      STREAM_INTERRUPTED_RE.test(String(newest.error || newest.content || ''));
+
+    // Terminal model/planner error or stream interruption stops the current run.
     if (
-      newest &&
-      newest.status === 'ERROR' &&
-      (newest.type === 'ERROR_MESSAGE' || newest.type === 'PLANNER_RESPONSE')
+      isStreamInterrupted ||
+      (newest &&
+        newest.status === 'ERROR' &&
+        (newest.type === 'ERROR_MESSAGE' || newest.type === 'PLANNER_RESPONSE'))
     ) {
       return {
         exists: true,
@@ -274,6 +513,8 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs,
         hasPostInitialWakeup,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
 
@@ -285,21 +526,41 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         size: info.size,
         steps,
         runState: 'working',
-        activity: null,
-        activityKind: null,
+        activity: pendingBackgroundCount > 0 ? summarizePendingBackgroundActivity(pendingBgTasks, pendingSubagents) : null,
+        activityKind: pendingBackgroundCount > 0 ? 'tool' : null,
         failure,
         lastProgressMs,
         lastTurnBoundaryMs,
         hasPostInitialWakeup,
         awaitingApproval: false,
+        pendingBackgroundCount,
+        backgroundProgressKey,
       };
     }
 
     const lastPlanner = rows[lastPlannerIdx];
     const toolCalls = Array.isArray(lastPlanner.tool_calls) ? lastPlanner.tool_calls : [];
 
-    // Stopped on a completed planner reply with zero tool calls.
+    // Stopped on a completed planner reply with zero tool calls unless background tasks/subagents are still running.
     if (toolCalls.length === 0 && lastPlanner.status === 'DONE') {
+      if (pendingBackgroundCount > 0) {
+        return {
+          exists: true,
+          mtimeMs: info.mtimeMs,
+          size: info.size,
+          steps,
+          runState: 'working',
+          activity: summarizePendingBackgroundActivity(pendingBgTasks, pendingSubagents),
+          activityKind: 'tool',
+          failure,
+          lastProgressMs,
+          lastTurnBoundaryMs,
+          hasPostInitialWakeup,
+          awaitingApproval: false,
+          pendingBackgroundCount,
+          backgroundProgressKey,
+        };
+      }
       return {
         exists: true,
         mtimeMs: info.mtimeMs,
@@ -313,6 +574,8 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs,
         hasPostInitialWakeup,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
 
@@ -321,7 +584,8 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
     if (
       swarmWaitIndex !== -1 &&
       genericsAfter.length >= toolCalls.length &&
-      genericsAfter[swarmWaitIndex]?.status === 'DONE'
+      genericsAfter[swarmWaitIndex]?.status === 'DONE' &&
+      pendingBackgroundCount === 0
     ) {
       return {
         exists: true,
@@ -336,13 +600,17 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs,
         hasPostInitialWakeup,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
 
     const awaitingApproval =
       genericsAfter.length < toolCalls.length &&
       toolCalls.slice(genericsAfter.length).some(call => APPROVAL_SENSITIVE_TOOLS.has(call?.name));
-    const { activity, activityKind } = summarizePlannerActivity(lastPlanner);
+    const plannerActivity = summarizePlannerActivity(lastPlanner);
+    const bgActivity =
+      pendingBackgroundCount > 0 ? summarizePendingBackgroundActivity(pendingBgTasks, pendingSubagents) : null;
 
     return {
       exists: true,
@@ -350,13 +618,15 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
       size: info.size,
       steps,
       runState: 'working',
-      activity,
-      activityKind,
+      activity: plannerActivity.activity ?? bgActivity,
+      activityKind: plannerActivity.activityKind ?? (bgActivity ? 'tool' : null),
       failure,
       lastProgressMs,
       lastTurnBoundaryMs,
       hasPostInitialWakeup,
       awaitingApproval,
+      pendingBackgroundCount,
+      backgroundProgressKey,
     };
   } catch (error) {
     if (error?.code === 'ENOENT') {
@@ -372,6 +642,8 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastProgressMs: null,
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
+        pendingBackgroundCount: 0,
+        backgroundProgressKey: '',
       };
     }
     throw error;
@@ -583,11 +855,16 @@ export async function inspectSwarmContinuation({
           lastProgressMs: null,
           lastTurnBoundaryMs: null,
           awaitingApproval: false,
+          pendingBackgroundCount: 0,
+          backgroundProgressKey: '',
         };
 
-    const progressKey = transcriptSummary.exists
+    const baseProgressKey = transcriptSummary.exists
       ? `${transcriptSummary.steps}:${transcriptSummary.size}:${Math.round(transcriptSummary.mtimeMs)}`
       : 'missing';
+    const progressKey = transcriptSummary.backgroundProgressKey
+      ? `${baseProgressKey}:bg[${transcriptSummary.backgroundProgressKey}]`
+      : baseProgressKey;
     workerSignatureParts.push(`${workerKey}:${progressKey}`);
 
     const pendingForMember = board.messages.some(

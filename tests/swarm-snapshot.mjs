@@ -381,6 +381,41 @@ try {
   assert.equal(updatedSnap.headSeq, 13);
   assert.notEqual(updatedSnap.etag, coordSnap.etag);
 
+  // 7b. Worker waiting on an unfinished background run_command reports status: 'active' with task activity (not 'waiting').
+  await writeTranscript(root, REVIEW_CONV, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-06-01T12:19:00.000Z', content: 'run tests' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-06-01T12:19:10.000Z',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"go test -race ./..."' } }],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      created_at: '2026-06-01T12:19:20.000Z',
+      content: `Tool is running as a background task with task id: ${REVIEW_CONV}/task-5`,
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-06-01T12:19:30.000Z',
+      content: 'Running go test -race in background; waiting.',
+    },
+  ]);
+  const bgSnap = await engine.getSnapshot({ agentId: 'agent-coord', etag: updatedSnap.etag }, mockPaseo);
+  assert.equal(bgSnap.status, 'ready');
+  assert.equal(bgSnap.live, true);
+  assert.equal(bgSnap.counts.active, 2);
+  assert.equal(bgSnap.counts.waiting, 1);
+  const bgReviewer = bgSnap.members.find(m => m.name === 'reviewer');
+  assert.equal(bgReviewer?.status, 'active');
+  assert.equal(bgReviewer?.activityKind, 'tool');
+  assert.match(bgReviewer?.activity ?? '', /task-5/);
+
   // 8. Server plugin contribute() wiring smoke test.
   const prevDataDirEnv = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
   process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR = root;

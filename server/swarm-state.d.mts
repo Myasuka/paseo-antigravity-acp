@@ -43,6 +43,8 @@ export interface MemberTranscriptSummary {
   lastTurnBoundaryMs: number | null;
   hasPostInitialWakeup?: boolean;
   awaitingApproval: boolean;
+  pendingBackgroundCount?: number;
+  backgroundProgressKey?: string;
 }
 
 export interface ObservedSwarmWorkerProgress {
