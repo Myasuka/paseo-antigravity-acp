@@ -27,6 +27,33 @@ const DEFERRED_LOAD_META_UPDATES = new Set([
   'session_info_update',
 ]);
 
+export const PROMPT_STOP_ERRORS = new Map([
+  ['max_tokens', 'AGY stopped because the model reached its token limit before finishing.'],
+  ['max_turn_requests', 'AGY stopped because the agent reached the request limit for this turn.'],
+  ['refusal', 'AGY stopped because the model or service refused or exhausted quota for this turn.'],
+]);
+
+export function isVisibleSessionUpdate(update) {
+  if (!update || typeof update !== 'object') return false;
+  if (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_message') {
+    if (update.content?.type === 'text') {
+      return typeof update.content.text === 'string' && update.content.text.trim().length > 0;
+    }
+    return Boolean(update.content);
+  }
+  if (
+    update.sessionUpdate === 'tool_call' ||
+    update.sessionUpdate === 'tool_call_update' ||
+    update.sessionUpdate === 'compaction_update'
+  ) {
+    return true;
+  }
+  if (update.sessionUpdate === 'plan') {
+    return Array.isArray(update.entries) && update.entries.length > 0;
+  }
+  return false;
+}
+
 function wait(ms, signal) {
   return new Promise(resolvePromise => {
     const done = () => {
@@ -245,6 +272,9 @@ export class BackgroundDrain {
     swarmWorkerStaleMs = DEFAULT_SWARM_WORKER_STALE_MS,
     preExistingSwarmWorkerStaleMs = 2 * 60 * 1000,
     swarmProgressThrottleMs = 1500,
+    cancelTimeoutMs = 30000,
+    onCancelTimeout = null,
+    detectBlankTurn = true,
     nativeFull = process.env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
     loadSettleMs = 400,
     loadMaxWaitMs = 15000,
@@ -271,18 +301,32 @@ export class BackgroundDrain {
     this.swarmWorkerStaleMs = swarmWorkerStaleMs;
     this.preExistingSwarmWorkerStaleMs = preExistingSwarmWorkerStaleMs;
     this.swarmProgressThrottleMs = swarmProgressThrottleMs;
+    this.cancelTimeoutMs = cancelTimeoutMs;
+    this.onCancelTimeout = typeof onCancelTimeout === 'function' ? onCancelTimeout : null;
+    this.detectBlankTurn = detectBlankTurn;
     this.nativeFull = nativeFull;
     this.loadSettleMs = loadSettleMs;
     this.loadMaxWaitMs = loadMaxWaitMs;
     this.loadMetaFlushDelayMs = loadMetaFlushDelayMs;
     this.requests = new Map();
     this.steerRequests = new Map();
+    this.cancelledSessions = new Set();
+    this.cancelTimers = new Map();
+    this.timedOutRequestIds = new Set();
     this.steerSeq = 0;
     this.roundSeq = 0;
     this.permissions = new Map();
     this.sessions = new Map();
     this.agentLane = Promise.resolve();
     this.closed = false;
+  }
+
+  clearCancelTimer(sessionId) {
+    if (!sessionId) return;
+    const entry = this.cancelTimers.get(sessionId);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this.cancelTimers.delete(sessionId);
   }
 
   isDeferredPromptResponse(message) {
@@ -739,6 +783,8 @@ export class BackgroundDrain {
     }
     const params = message.params ?? {};
     if (['session/load', 'session/close'].includes(message.method) && params.sessionId) {
+      this.clearCancelTimer(params.sessionId);
+      this.cancelledSessions.delete(params.sessionId);
       const session = this.sessions.get(params.sessionId);
       if (session) {
         session.suppressedToolIds.clear();
@@ -749,8 +795,55 @@ export class BackgroundDrain {
     }
     if (['session/cancel', 'session/close'].includes(message.method)) {
       this.sessions.get(params.sessionId)?.round?.controller.abort();
+      if (message.method === 'session/cancel' && params.sessionId) {
+        const sessionId = params.sessionId;
+        this.cancelledSessions.add(sessionId);
+        const isDraining = Boolean(this.sessions.get(sessionId)?.round?.draining);
+        if (!isDraining && this.cancelTimeoutMs > 0 && !this.cancelTimers.has(sessionId)) {
+          let pendingReqId;
+          for (const [reqId, entry] of this.requests.entries()) {
+            if (entry.method === 'session/prompt' && entry.sessionId === sessionId) {
+              pendingReqId = reqId;
+            }
+          }
+          if (pendingReqId !== undefined) {
+            const timer = setTimeout(() => {
+              this.cancelTimers.delete(sessionId);
+              if (this.closed || !this.requests.has(pendingReqId)) return;
+              this.requests.delete(pendingReqId);
+              this.cancelledSessions.delete(sessionId);
+              this.timedOutRequestIds.add(pendingReqId);
+              while (this.timedOutRequestIds.size > 128) {
+                const oldest = this.timedOutRequestIds.values().next().value;
+                if (oldest === undefined) break;
+                this.timedOutRequestIds.delete(oldest);
+              }
+              const curSession = this.sessions.get(sessionId);
+              if (curSession?.round) {
+                const hungRound = curSession.round;
+                curSession.round = null;
+                for (const [steerId, sEntry] of this.steerRequests.entries()) {
+                  if (sEntry.round === hungRound) this.steerRequests.delete(steerId);
+                }
+              }
+              this.emit({ jsonrpc: '2.0', id: pendingReqId, result: { stopReason: 'cancelled' } });
+              if (this.onCancelTimeout) {
+                setImmediate(() => {
+                  if (!this.closed) this.onCancelTimeout(sessionId);
+                });
+              }
+            }, this.cancelTimeoutMs);
+            timer.unref?.();
+            this.cancelTimers.set(sessionId, { timer, requestId: pendingReqId });
+          }
+        }
+      }
     }
     if (message.method === 'session/prompt') {
+      if (params.sessionId) {
+        this.clearCancelTimer(params.sessionId);
+        this.cancelledSessions.delete(params.sessionId);
+      }
       const existing = params.sessionId ? this.sessions.get(params.sessionId) : undefined;
       if (existing?.pendingLoad) {
         this.flushPendingLoad(existing, { immediateMeta: true });
@@ -793,6 +886,7 @@ export class BackgroundDrain {
         swarmProgress: null,
         progressCardSeq: 0,
         lastSwarmState: null,
+        sawVisibleOutput: false,
       };
     }
     if ('id' in message) this.requests.set(message.id, { method: message.method, sessionId: params.sessionId });
@@ -874,6 +968,9 @@ export class BackgroundDrain {
         return message;
       }
       if (this.filterStaleReplay(session, sessionId, update)) return null;
+      if (session?.round && isVisibleSessionUpdate(update)) {
+        session.round.sawVisibleOutput = true;
+      }
       if (
         session?.round &&
         session.round.projection.hasOpenForegroundTools() &&
@@ -886,6 +983,10 @@ export class BackgroundDrain {
       return message;
     }
     if (!('id' in message) || message.method) return message;
+    if (this.timedOutRequestIds.has(message.id)) {
+      this.timedOutRequestIds.delete(message.id);
+      return null;
+    }
     const steerReq = this.steerRequests.get(message.id);
     if (steerReq) {
       this.steerRequests.delete(message.id);
@@ -921,6 +1022,25 @@ export class BackgroundDrain {
               },
             },
           });
+        } else if (
+          !message.error &&
+          PROMPT_STOP_ERRORS.has(message.result?.stopReason) &&
+          !activeRound.controller.signal.aborted
+        ) {
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: steerReq.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: {
+                  type: 'text',
+                  text: `\n\n[Mid-turn guidance incomplete: ${PROMPT_STOP_ERRORS.get(message.result.stopReason)}]`,
+                },
+              },
+            },
+          });
         }
         if (activeRound.steerInFlight?.id === message.id) {
           activeRound.steerInFlight = null;
@@ -942,14 +1062,29 @@ export class BackgroundDrain {
       return null;
     }
     if (request?.method !== 'session/prompt') return message;
+    this.clearCancelTimer(request.sessionId);
     const session = this.sessions.get(request.sessionId);
     const round = session?.round;
-    if (!round) return message;
+    const wasCancelled = Boolean(round?.controller.signal.aborted || this.cancelledSessions.has(request.sessionId));
+    this.cancelledSessions.delete(request.sessionId);
     try {
-      if (message.error || message.result?.stopReason !== 'end_turn') return message;
-      if (round.controller.signal.aborted) {
-        return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
+      if (message.error) return message;
+      if (wasCancelled) {
+        return { ...message, result: { ...(message.result ?? {}), stopReason: 'cancelled' } };
       }
+      const stopReason = message.result?.stopReason;
+      if (typeof stopReason === 'string' && PROMPT_STOP_ERRORS.has(stopReason)) {
+        return {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: -32000,
+            message: PROMPT_STOP_ERRORS.get(stopReason),
+            data: { stopReason },
+          },
+        };
+      }
+      if (!round || stopReason !== 'end_turn') return message;
       round.projection.add(await round.tail.read());
       round.projection.flushCompletedForegroundTools();
       let state = round.projection.inspect();
@@ -971,6 +1106,24 @@ export class BackgroundDrain {
           !state.hasPostForegroundWork &&
           !round.projection.hasOpenForegroundTools())
       ) {
+        if (
+          this.detectBlankTurn &&
+          !round.sawVisibleOutput &&
+          !round.projection.hasVisibleOutput()
+        ) {
+          const blankMsg = state.failure
+            ? `AGY ended the turn with no visible response or tool activity (${state.failure})`
+            : 'AGY ended the turn with no visible response or tool activity.';
+          return {
+            jsonrpc: '2.0',
+            id: message.id,
+            error: {
+              code: -32000,
+              message: blankMsg,
+              data: { stopReason: 'end_turn', blankTurn: true },
+            },
+          };
+        }
         this.recordRoundReplay(session, round);
         return message;
       }
@@ -1068,23 +1221,27 @@ export class BackgroundDrain {
       }
       return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
     } catch (error) {
-      this.finalizeSwarmProgressCard(request.sessionId, round, round.lastSwarmState, {
-        status: 'failed',
-        phase: 'failed',
-        note: error.message,
-      });
+      if (round) {
+        this.finalizeSwarmProgressCard(request.sessionId, round, round.lastSwarmState, {
+          status: 'failed',
+          phase: 'failed',
+          note: error.message,
+        });
+      }
       return {
         jsonrpc: '2.0',
         id: message.id,
         error: { code: -32000, message: `AGY background continuation failed: ${error.message}` },
       };
     } finally {
-      round.draining = false;
-      round.steerInFlight = null;
-      for (const [steerId, entry] of this.steerRequests.entries()) {
-        if (entry.round === round) this.steerRequests.delete(steerId);
+      if (round) {
+        round.draining = false;
+        round.steerInFlight = null;
+        for (const [steerId, entry] of this.steerRequests.entries()) {
+          if (entry.round === round) this.steerRequests.delete(steerId);
+        }
+        if (session?.round === round) session.round = null;
       }
-      if (session.round === round) session.round = null;
     }
   }
 
@@ -1094,6 +1251,12 @@ export class BackgroundDrain {
 
   close() {
     this.closed = true;
+    for (const entry of this.cancelTimers.values()) {
+      clearTimeout(entry.timer);
+    }
+    this.cancelTimers.clear();
+    this.cancelledSessions.clear();
+    this.timedOutRequestIds.clear();
     for (const session of this.sessions.values()) {
       session.round?.controller.abort();
       this.cancelPendingLoad(session);

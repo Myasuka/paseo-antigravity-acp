@@ -27,6 +27,7 @@ A standalone [Paseo](https://github.com/getpaseo/paseo) plugin (`>=0.15.4`) that
 ### 3. Per-Model Thinking Options, Rich Tool Cards & History Timestamps
 - Automatically probes each model's `thought_level` options during catalog discovery (`low` / `medium` / `high` / `xhigh`, or hides the selector on models without thinking levels).
 - Maps Antigravity tool calls (`run_command`, `read_file`, `edit_file`, `write_file`, `grep_search`, `find_by_name`, `search_web`, `read_url_content`, `invoke_subagent`, `manage_subagents`, `send_message`, `swarm`, `post_message`, `read_board`, `swarm_wait`) into native Paseo tool detail cards, and marks failed tool outputs accurately even when ACP reports `completed`.
+- Hardens ACP turn reliability: maps `max_tokens`, `max_turn_requests`, and `refusal` stop reasons as structured failures, catches silent blank `end_turn` responses with zero visible text/tool activity, protects `session/cancel` against `end_turn` race conditions and hangs (`PASEO_AGY_CANCEL_TIMEOUT_MS`, default `30000`), and normalizes `http` / `sse` / `stdio` `mcpServers` headers and env pairs before forwarding to `agy acp`.
 - Restores original message and tool completion timestamps from local Antigravity transcripts when reopening closed sessions via `session/load`, and drains asynchronous `agy acp` `session/load` history replay before releasing the load response so reopened long sessions never append duplicate output or overwrite turn completion timestamps.
 
 ### 4. Background & Native `/swarm` Turn Continuation, Live Progress & Mid-Swarm Steering

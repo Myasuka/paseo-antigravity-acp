@@ -5,6 +5,7 @@ import { AccessPolicy } from './access-policy.mjs';
 import { SessionMetadata } from './session-metadata.mjs';
 import { preserveToolContent } from './tool-content.mjs';
 import { BackgroundDrain } from './background-drain.mjs';
+import { normalizeMcpServersMessage } from './mcp-normalize.mjs';
 import { mergeReadOnlyRoots, parseExtraReadRoots, resolveAgyBinary } from './resolve-agy.mjs';
 
 const policyPath = process.env.PASEO_AGY_READ_POLICY_FILE ?? new URL('./read-policy.json', import.meta.url);
@@ -23,6 +24,10 @@ const metadata = new SessionMetadata({
 const backgroundTimeout = Number(process.env.PASEO_AGY_BACKGROUND_TIMEOUT_MS ?? 3600000);
 if (!Number.isInteger(backgroundTimeout) || backgroundTimeout < 1000 || backgroundTimeout > 86400000) {
   throw new Error('PASEO_AGY_BACKGROUND_TIMEOUT_MS must be between 1000 and 86400000');
+}
+const cancelTimeout = Number(process.env.PASEO_AGY_CANCEL_TIMEOUT_MS ?? 30000);
+if (!Number.isInteger(cancelTimeout) || cancelTimeout < 0 || cancelTimeout > 600000) {
+  throw new Error('PASEO_AGY_CANCEL_TIMEOUT_MS must be between 0 and 600000');
 }
 
 const resolved = resolveAgyBinary({ env: process.env });
@@ -48,6 +53,11 @@ const background = new BackgroundDrain({
   emit: deliver,
   writeUpstream: msg => write(child.stdin, msg),
   timeoutMs: backgroundTimeout,
+  cancelTimeoutMs: cancelTimeout,
+  onCancelTimeout: () => {
+    const timer = setTimeout(stop, 25);
+    timer.unref?.();
+  },
 });
 let stopping = false;
 let timer;
@@ -98,7 +108,10 @@ async function clientLine(line) {
     return;
   }
   try {
-    write(child.stdin, await background.fromClient(metadata.fromClient(policy.fromClient(message))));
+    write(
+      child.stdin,
+      await background.fromClient(normalizeMcpServersMessage(metadata.fromClient(policy.fromClient(message)))),
+    );
   } catch (error) {
     if ('id' in message) {
       deliver({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: error.message } });

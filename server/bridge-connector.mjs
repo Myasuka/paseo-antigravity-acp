@@ -3,6 +3,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { AccessPolicy } from './access-policy.mjs';
 import { BackgroundDrain } from './background-drain.mjs';
+import { normalizeMcpServersMessage } from './mcp-normalize.mjs';
 import { mergeReadOnlyRoots, parseExtraReadRoots, resolveAgyBinary } from './resolve-agy.mjs';
 import { SessionMetadata } from './session-metadata.mjs';
 import { preserveToolContent } from './tool-content.mjs';
@@ -42,6 +43,10 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
   const backgroundTimeout = Number(env.PASEO_AGY_BACKGROUND_TIMEOUT_MS ?? 3600000);
   if (!Number.isInteger(backgroundTimeout) || backgroundTimeout < 1000 || backgroundTimeout > 86400000) {
     throw new Error('PASEO_AGY_BACKGROUND_TIMEOUT_MS must be between 1000 and 86400000');
+  }
+  const cancelTimeout = Number(env.PASEO_AGY_CANCEL_TIMEOUT_MS ?? 30000);
+  if (!Number.isInteger(cancelTimeout) || cancelTimeout < 0 || cancelTimeout > 600000) {
+    throw new Error('PASEO_AGY_CANCEL_TIMEOUT_MS must be between 0 and 600000');
   }
 
   const resolved = resolveAgyBinary({ env });
@@ -122,6 +127,11 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
     writeUpstream: writeChild,
     dataDir: env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || undefined,
     timeoutMs: backgroundTimeout,
+    cancelTimeoutMs: cancelTimeout,
+    onCancelTimeout: () => {
+      const timer = setTimeout(stop, 25);
+      timer.unref?.();
+    },
     nativeFull: env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
   });
 
@@ -215,7 +225,9 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
   const writable = new WritableStream({
     async write(message) {
       try {
-        const next = await background.fromClient(metadata.fromClient(policy.fromClient(message)));
+        const next = await background.fromClient(
+          normalizeMcpServersMessage(metadata.fromClient(policy.fromClient(message))),
+        );
         writeChild(next);
       } catch (error) {
         if (message && typeof message === 'object' && 'id' in message && message.id !== undefined) {

@@ -323,6 +323,17 @@ export class BackgroundProjection {
     };
   }
 
+  hasVisibleOutput() {
+    if (this.groups.some(group => typeof group === 'string' && group.trim().length > 0)) return true;
+    if (this.tools.size > 0 || this.sent.size > 0) return true;
+    for (const row of this.rows.values()) {
+      if (row.type !== 'PLANNER_RESPONSE') continue;
+      if (typeof row.content === 'string' && row.content.trim().length > 0) return true;
+      if (Array.isArray(row.tool_calls) && row.tool_calls.length > 0) return true;
+    }
+    return false;
+  }
+
   add(rows) {
     for (const row of rows) this.rows.set(row.step_index, row);
   }

@@ -27,6 +27,7 @@
 ### 3. 逐模型独立思维档位、原生工具卡片与历史时间戳恢复
 - 目录发现阶段自动探测每个模型支持的 `thought_level` 档位（如 `low` / `medium` / `high` / `xhigh`，不支持思维档位的模型自动隐藏选择器）。
 - 将 `run_command`、`read_file`、`edit_file`、`write_file`、`grep_search`、`find_by_name`、`search_web`、`read_url_content`、`invoke_subagent`、`manage_subagents`、`send_message` 以及 Swarm 工具（`swarm`、`post_message`、`read_board`、`swarm_wait`）映射为结构化 Paseo 工具详情卡片，并修正命令失败时的工具错误状态展示。
+- 强化 ACP 协议边界健壮性：将 `max_tokens`、`max_turn_requests`、`refusal` 及零可见输出的空白 `end_turn` 显式转为结构化失败；修正本地 `session/cancel` 与内核 `end_turn` 的竞态并提供可配置取消超时熔断（`PASEO_AGY_CANCEL_TIMEOUT_MS`，默认 `30000`）；规范化 `http` / `sse` / `stdio` `mcpServers` 的 headers 与 env 键值对格式。
 - 在关闭后重开会话（`session/load`）重放历史消息时，自动从本地 Antigravity transcript 读取真实消息与工具完成时间戳注入 `timeline.item.timestamp`；并在桥接层等待 `agy acp` 异步历史回放完全排空后再放行 `session/load` 响应，彻底避免重开长会话时发生消息重复输出及轮次完成时间被改写成当前时间的问题。
 
 ### 4. 后台任务与原生 `/swarm` 自动排空接续、主线实时进度卡与非破坏性中途引导

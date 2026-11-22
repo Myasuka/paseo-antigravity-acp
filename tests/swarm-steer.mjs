@@ -441,9 +441,60 @@ async function setupHarness({ offeredCapabilities = ['prompt.message', 'prompt.s
     await h.waitFor(ev => ev.some(e => e.type === 'session.turn' && e.turnId === 'acp:p2' && e.state === 'canceled'));
     await h.waitFor(() => h.cancelCalls.length === 1, 'session/cancel timeout');
     assert.equal(h.cancelCalls.length, 1, 'Explicit session.interrupt must forward session/cancel');
+
+    // 4. E2E protocol hardening checks through createDetailedAgyProvider + AcpRuntime:
+    await writeWorker([
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'next phase' },
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), content: 'Phase 2 stopped.' },
+    ]);
+    // 4a. Abnormal stopReason (refusal) fails turn instead of falsely completing
+    h.setPromptHandler(async () => ({ stopReason: 'refusal' }));
+    await h.connection.send({
+      type: 'session.prompt',
+      sessionId: 's1',
+      prompt: { clientMessageId: 'p3-refusal', delivery: 'auto', input: { type: 'message', content: [{ type: 'text', text: 'Quota test' }] } },
+    });
+    await h.waitFor(ev => ev.some(e => e.type === 'session.turn' && e.turnId === 'acp:p3-refusal' && e.state === 'failed'));
+    const p3Fail = h.events.find(e => e.type === 'session.turn' && e.turnId === 'acp:p3-refusal' && e.state === 'failed');
+    assert.match(p3Fail.error.message, /refused|quota/i);
+
+    // 4b. Blank end_turn (thought-only with no visible reply or tool call) fails turn loudly
+    h.setPromptHandler(async ({ notify }) => {
+      await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'internal only' } });
+      return { stopReason: 'end_turn' };
+    });
+    await h.connection.send({
+      type: 'session.prompt',
+      sessionId: 's1',
+      prompt: { clientMessageId: 'p4-blank', delivery: 'auto', input: { type: 'message', content: [{ type: 'text', text: 'Blank test' }] } },
+    });
+    await h.waitFor(ev => ev.some(e => e.type === 'session.turn' && e.turnId === 'acp:p4-blank' && e.state === 'failed'));
+    const p4Fail = h.events.find(e => e.type === 'session.turn' && e.turnId === 'acp:p4-blank' && e.state === 'failed');
+    assert.match(p4Fail.error.message, /no visible response/i);
+
+    // 4c. Local session.interrupt while agent acknowledges with end_turn coerces turn state to canceled
+    let releaseP5;
+    const p5Gate = new Promise(resolve => {
+      releaseP5 = resolve;
+    });
+    const promptCountBeforeP5 = h.promptCalls.length;
+    h.setPromptHandler(async () => {
+      await p5Gate;
+      return { stopReason: 'end_turn' };
+    });
+    await h.connection.send({
+      type: 'session.prompt',
+      sessionId: 's1',
+      prompt: { clientMessageId: 'p5-race', delivery: 'auto', input: { type: 'message', content: [{ type: 'text', text: 'Cancel race' }] } },
+    });
+    await h.waitFor(() => h.promptCalls.length === promptCountBeforeP5 + 1, 'p5 prompt call');
+    await h.connection.send({ type: 'session.interrupt', requestId: 'int-race', sessionId: 's1' });
+    await h.waitFor(() => h.cancelCalls.length === 2, 'p5 cancel call');
+    releaseP5();
+    await h.waitFor(ev => ev.some(e => e.type === 'session.turn' && e.turnId === 'acp:p5-race' && e.state === 'canceled'));
   } finally {
     await h.cleanup();
   }
 }
 
-console.log(JSON.stringify({ passed: true, suite: 'swarm-steer', promptCallsCounted: 3 }));
+console.log(JSON.stringify({ passed: true, suite: 'swarm-steer', promptCallsCounted: 6 }));

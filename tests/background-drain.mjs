@@ -2023,4 +2023,129 @@ await scenario(async ({ root, bridge, emitted, append, begin }) => {
   assert.equal((await done3).result.stopReason, 'cancelled', 'Foreign USER_INPUT beyond expected steers must still cancel');
 });
 
+// Case 15: Abnormal stopReasons (max_tokens, max_turn_requests, refusal) convert to -32000 JSON-RPC errors,
+// and steer hitting an abnormal stopReason emits an inline warning without breaking the active drain turn.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  for (const reason of ['max_tokens', 'max_turn_requests', 'refusal']) {
+    await bridge.fromClient({
+      jsonrpc: '2.0',
+      id: reason,
+      method: 'session/prompt',
+      params: { sessionId: id, prompt: [{ type: 'text', text: reason }] },
+    });
+    const out = await bridge.fromAgent({
+      jsonrpc: '2.0',
+      id: reason,
+      result: { stopReason: reason },
+    });
+    assert.equal(out.error?.code, -32000, `${reason} must map to -32000 error`);
+    assert.equal(out.error?.data?.stopReason, reason);
+  }
+
+  // Steer abnormal stopReason during Swarm drain warns inline and keeps Swarm turn running
+  const upstream = [];
+  bridge.writeUpstream = msg => upstream.push(msg);
+  bridge.nativeFull = true;
+  bridge.pollMs = 10;
+  bridge.settleMs = 15;
+  await setupSwarm(root, {
+    members: { impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false } },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl go', time: new Date().toISOString() }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'go' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/x"' } }] },
+  ]);
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'start' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm', args: { action: '"add"', name: '"impl"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Spawned' },
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-add-sr', name: 'swarm', status: 'completed', rawInput: { action: 'add', name: 'impl' } } },
+  });
+  const done = bridge.fromAgent(response);
+  await delay(25);
+  assert.equal(await bridge.steer(id, [{ type: 'text', text: 'nudge' }]), true);
+  assert.equal(await bridge.fromAgent({ jsonrpc: '2.0', id: 'agy-steer:1', result: { stopReason: 'max_tokens' } }), null);
+  assert.ok(
+    emitted.some(e => e.params?.update?.sessionUpdate === 'agent_message_chunk' && /token limit/i.test(e.params.update.content?.text ?? '')),
+    'Steer hitting max_tokens must emit inline notice',
+  );
+  await bridge.fromClient({ method: 'session/cancel', params: { sessionId: id } });
+  assert.equal((await done).result.stopReason, 'cancelled');
+});
+
+// Case 16: Blank-turn detection catches silent end_turn (including thought-only / usage-only / transcript ERROR_MESSAGE),
+// while allowing valid visible outputs (message chunk, tool call, compaction, plan, or transcript planner step).
+await scenario(async ({ bridge, append, begin }) => {
+  // 16a: Thought-only + usage-only end_turn
+  await begin();
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } } },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'usage_update', used: 10, size: 100 } },
+  });
+  const blankThought = await bridge.fromAgent(response);
+  assert.equal(blankThought.error?.code, -32000);
+  assert.equal(blankThought.error?.data?.blankTurn, true);
+
+  // 16b: Whitespace-only message + ERROR_MESSAGE in transcript surfaces error detail
+  await bridge.fromClient({ jsonrpc: '2.0', id: 2, method: 'session/prompt', params: { sessionId: id, prompt: [{ type: 'text', text: '2' }] } });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '   \n' } } },
+  });
+  await append([{ step_index: 0, type: 'ERROR_MESSAGE', status: 'ERROR', error: 'Upstream backend 503' }]);
+  const blankErr = await bridge.fromAgent({ ...response, id: 2 });
+  assert.equal(blankErr.error?.code, -32000);
+  assert.match(blankErr.error.message, /Upstream backend 503/);
+
+  // 16c: Plan update counts as visible output
+  await bridge.fromClient({ jsonrpc: '2.0', id: 3, method: 'session/prompt', params: { sessionId: id, prompt: [{ type: 'text', text: '3' }] } });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'plan', entries: [{ content: 'Step 1', status: 'pending' }] } },
+  });
+  assert.equal((await bridge.fromAgent({ ...response, id: 3 })).result?.stopReason, 'end_turn');
+});
+
+// Case 17: session/cancel race correction (end_turn/refusal -> cancelled) & cancel timeout recovery without leaking late response.
+await scenario(async ({ bridge, emitted }) => {
+  // 17a: UUID session cancelled locally before agent replies end_turn -> coerced to cancelled
+  await bridge.fromClient({ jsonrpc: '2.0', id: 21, method: 'session/prompt', params: { sessionId: id, prompt: [{ type: 'text', text: 'race' }] } });
+  await bridge.fromClient({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: id } });
+  const racedUuid = await bridge.fromAgent({ jsonrpc: '2.0', id: 21, result: { stopReason: 'end_turn' } });
+  assert.equal(racedUuid.result?.stopReason, 'cancelled');
+
+  // 17b: Non-UUID session cancelled locally before agent replies max_tokens -> also coerced to cancelled
+  await bridge.fromClient({ jsonrpc: '2.0', id: 22, method: 'session/prompt', params: { sessionId: 'custom-sid', prompt: [{ type: 'text', text: 'race2' }] } });
+  await bridge.fromClient({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: 'custom-sid' } });
+  const racedNonUuid = await bridge.fromAgent({ jsonrpc: '2.0', id: 22, result: { stopReason: 'max_tokens' } });
+  assert.equal(racedNonUuid.result?.stopReason, 'cancelled');
+
+  // 17c: Hung prompt after session/cancel triggers cancelTimeoutMs, emits cancelled response, invokes onCancelTimeout, and swallows late reply
+  let timedOutSid = null;
+  bridge.cancelTimeoutMs = 30;
+  bridge.onCancelTimeout = sid => {
+    timedOutSid = sid;
+  };
+  await bridge.fromClient({ jsonrpc: '2.0', id: 23, method: 'session/prompt', params: { sessionId: id, prompt: [{ type: 'text', text: 'hang' }] } });
+  await bridge.fromClient({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: id } });
+  await delay(60);
+  const timeoutEmit = emitted.find(e => e.id === 23);
+  assert.deepEqual(timeoutEmit?.result, { stopReason: 'cancelled' });
+  assert.equal(timedOutSid, id);
+  assert.equal(
+    await bridge.fromAgent({ jsonrpc: '2.0', id: 23, result: { stopReason: 'end_turn' } }),
+    null,
+    'Late response after cancel timeout must be swallowed',
+  );
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));
