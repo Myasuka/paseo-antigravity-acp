@@ -1,6 +1,6 @@
 {
   "name": "paseo-antigravity-acp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Google Antigravity (agy acp) provider plugin for Paseo with interactive approvals, per-model thinking, background & Swarm continuation, and a live Swarm visualizer.",
   "license": "Apache-2.0",
   "type": "module",

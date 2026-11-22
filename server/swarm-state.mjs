@@ -9,6 +9,7 @@ const BG_TASK_LAUNCH_RE = new RegExp(
 );
 const BG_TASK_DONE_RE =
   /content=Task id "([^"]+)" (?:was\s+)?(?:finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:/gi;
+const SYSTEM_MESSAGE_SENDER_RE = /\[Message\][^\n]*\bsender=([^\s]+)/gi;
 const CREATED_SUBAGENT_RE = new RegExp(
   `(?:^|\\n)Created the following subagent:\\s*\\{[\\s\\S]*?"conversationId"\\s*:\\s*"(${UUID_PATTERN})"`,
   'i',
@@ -186,6 +187,13 @@ function extractCommandHeader(content) {
   return typeof content === 'string' ? content.split(/\nCommand output:/)[0] : '';
 }
 
+function matchesTaskOrSender(targetId, candidate) {
+  const target = typeof targetId === 'string' ? targetId.trim().toLowerCase() : '';
+  const cand = typeof candidate === 'string' ? candidate.trim().toLowerCase() : '';
+  if (!target || !cand) return false;
+  return target === cand || target.endsWith(`/${cand}`) || cand.endsWith(`/${target}`);
+}
+
 function summarizeBackgroundCommand(args, content) {
   const toolSummary = decodeToolArgValue(args?.toolSummary);
   if (typeof toolSummary === 'string' && toolSummary.trim()) {
@@ -194,6 +202,10 @@ function summarizeBackgroundCommand(args, content) {
   const cmd = decodeToolArgValue(args?.CommandLine);
   if (typeof cmd === 'string' && cmd.trim()) {
     return cmd.trim().replace(/\s+/g, ' ').slice(0, 80);
+  }
+  const prompt = decodeToolArgValue(args?.Prompt) ?? decodeToolArgValue(args?.Description);
+  if (typeof prompt === 'string' && prompt.trim()) {
+    return prompt.trim().replace(/\s+/g, ' ').slice(0, 80);
   }
   const descMatch = /^Task Description:\s*(.+)$/m.exec(extractCommandHeader(content));
   if (descMatch?.[1]?.trim()) {
@@ -206,8 +218,9 @@ function summarizePendingBackgroundActivity(pendingBgTasks, pendingSubagents) {
   if (pendingBgTasks.size > 0) {
     let latest;
     for (const entry of pendingBgTasks.values()) latest = entry;
+    const toolLabel = latest.toolName || 'run_command';
     const base = latest.summary
-      ? `run_command (${latest.taskName}): ${latest.summary}`
+      ? `${toolLabel} (${latest.taskName}): ${latest.summary}`
       : `Waiting on background task (${latest.taskName})`;
     const suffix = pendingBgTasks.size > 1 ? ` (+${pendingBgTasks.size - 1})` : '';
     return `${base.slice(0, 120 - suffix.length)}${suffix}`;
@@ -224,6 +237,19 @@ function trackPendingBackgroundWork(rows) {
   const knownSubagents = new Map();
   const pendingSubagents = new Map();
 
+  const deleteTimersForSenderOrTarget = senderOrTaskId => {
+    for (const [taskId, entry] of [...pendingBgTasks.entries()]) {
+      if (!entry.isTimer) continue;
+      const cond = entry.timerCondition;
+      if (
+        matchesTaskOrSender(taskId, senderOrTaskId) ||
+        (cond && (cond.toLowerCase() === 'any' || matchesTaskOrSender(cond, senderOrTaskId)))
+      ) {
+        pendingBgTasks.delete(taskId);
+      }
+    }
+  };
+
   for (const row of rows) {
     if (row.type === 'PLANNER_RESPONSE') {
       const calls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
@@ -239,17 +265,38 @@ function trackPendingBackgroundWork(rows) {
     if (row.type === 'GENERIC' && queue.length > 0) {
       const ref = queue.shift();
       const content = typeof row.content === 'string' ? row.content : '';
-      const isDaemon = ref.name === 'run_command' && decodeToolArgValue(ref.args?.IsDaemon) === true;
       const launchMatch =
-        ref.name === 'run_command' && !isDaemon
-          ? BG_TASK_LAUNCH_RE.exec(extractCommandHeader(content))
-          : null;
+        row.status === 'RUNNING' ? BG_TASK_LAUNCH_RE.exec(extractCommandHeader(content)) : null;
       if (launchMatch) {
         const taskId = launchMatch[1].toLowerCase();
+        const isDaemonCmd = ref.name === 'run_command' && decodeToolArgValue(ref.args?.IsDaemon) === true;
+        if (isDaemonCmd) continue;
+        if (ref.name === 'schedule') {
+          const isDaemonSched = decodeToolArgValue(ref.args?.IsDaemon) === true;
+          const cron = decodeToolArgValue(ref.args?.CronExpression);
+          const hasCron = typeof cron === 'string' && cron.trim().length > 0;
+          const duration = Number(decodeToolArgValue(ref.args?.DurationSeconds));
+          if (isDaemonSched || hasCron || !(Number.isFinite(duration) && duration > 0)) continue;
+          const rawCond = decodeToolArgValue(ref.args?.TimerCondition);
+          const condStr = typeof rawCond === 'string' ? rawCond.trim() : '';
+          const timerCondition = !condStr || condStr.toLowerCase() === 'never' ? null : condStr;
+          const taskName = taskId.split('/')[1] || taskId;
+          pendingBgTasks.set(taskId, {
+            taskName,
+            toolName: 'schedule',
+            summary: summarizeBackgroundCommand(ref.args, content),
+            isTimer: true,
+            timerCondition,
+          });
+          continue;
+        }
         const taskName = taskId.split('/')[1] || taskId;
         pendingBgTasks.set(taskId, {
           taskName,
+          toolName: ref.name || 'run_command',
           summary: summarizeBackgroundCommand(ref.args, content),
+          isTimer: false,
+          timerCondition: null,
         });
         continue;
       }
@@ -259,10 +306,13 @@ function trackPendingBackgroundWork(rows) {
         const rawTarget = decodeToolArgValue(ref.args?.TaskId);
         if (action === 'kill' && typeof rawTarget === 'string' && rawTarget.trim()) {
           const target = rawTarget.trim().toLowerCase();
-          pendingBgTasks.delete(target);
           for (const existingKey of [...pendingBgTasks.keys()]) {
-            if (existingKey.endsWith(`/${target}`)) pendingBgTasks.delete(existingKey);
+            if (matchesTaskOrSender(existingKey, target)) {
+              pendingBgTasks.delete(existingKey);
+              deleteTimersForSenderOrTarget(existingKey);
+            }
           }
+          deleteTimersForSenderOrTarget(target);
         }
         continue;
       }
@@ -332,7 +382,12 @@ function trackPendingBackgroundWork(rows) {
         pendingSubagents.delete(directMatch[1].toLowerCase());
       }
       for (const idleMatch of content.matchAll(SYSTEM_SUBAGENT_IDLE_RE)) {
-        pendingSubagents.delete(idleMatch[1].toLowerCase());
+        const subId = idleMatch[1].toLowerCase();
+        pendingSubagents.delete(subId);
+        deleteTimersForSenderOrTarget(subId);
+      }
+      for (const msgMatch of content.matchAll(SYSTEM_MESSAGE_SENDER_RE)) {
+        deleteTimersForSenderOrTarget(msgMatch[1]);
       }
       if (SERVER_RESTART_NOTICE_RE.test(content)) {
         pendingBgTasks.clear();

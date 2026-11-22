@@ -922,5 +922,146 @@ const nowMs = Date.parse('2026-06-01T12:00:00.000Z');
   }
 }
 
+// 15. One-shot schedule timers mark worker working until fired or cancelled by TimerCondition; recurring cron does not.
+{
+  const root = await mkdtemp(join(tmpdir(), 'agy-swarm-cont-15-'));
+  try {
+    const recentIso = new Date(nowMs - 8 * 1000).toISOString();
+    await writeSwarm(root, {
+      members: {
+        worker: {
+          conversation_id: WORKER_CONV,
+          role: 'worker',
+          phase: 'WAITING',
+          wake_mode: 'mentions',
+          last_read_seq: 1,
+          killed: false,
+        },
+      },
+      posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@worker wait rollout', time: recentIso }],
+    });
+
+    // 15a: Pending one-shot schedule keeps worker working with schedule activity summary.
+    const tpPendingTimer = await writeTranscript(root, WORKER_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'wait rollout' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [{ name: 'schedule', args: { DurationSeconds: '36', Prompt: '"Verify rollout"' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-2`,
+      },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, content: 'Waiting for timer.' },
+    ]);
+    const workingSummary = await summarizeMemberTranscript(tpPendingTimer, nowMs);
+    assert.equal(workingSummary.pendingBackgroundCount, 1);
+    assert.equal(workingSummary.runState, 'working');
+    assert.match(workingSummary.activity ?? '', /^schedule \(task-2\): Verify rollout/);
+    assert.equal((await inspectSwarmContinuation({ dataDir: root, sessionId: COORD_CONV, nowMs })).active, true);
+
+    // 15b: Once timer fires via SYSTEM_MESSAGE sender=<workerConv>/task-2, pendingBackgroundCount clears.
+    const tpTimerFired = await writeTranscript(root, WORKER_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'wait rollout' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [{ name: 'schedule', args: { DurationSeconds: '36', Prompt: '"Verify rollout"' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-2`,
+      },
+      {
+        step_index: 3,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: recentIso,
+        content: `<SYSTEM_MESSAGE>\n[Message] sender=${WORKER_CONV}/task-2 content=Verify rollout\n</SYSTEM_MESSAGE>`,
+      },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, content: 'Rollout verified.' },
+    ]);
+    const firedSummary = await summarizeMemberTranscript(tpTimerFired, nowMs);
+    assert.equal(firedSummary.pendingBackgroundCount, 0);
+    assert.equal(firedSummary.runState, 'waiting');
+
+    // 15c: TimerCondition silently cancels timer when target task finishes, and recurring cron does not block settling.
+    const tpCondCancelled = await writeTranscript(root, WORKER_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'run + cron' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [{ name: 'run_command', args: { CommandLine: '"build"' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-1`,
+      },
+      {
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [
+          {
+            name: 'schedule',
+            args: {
+              DurationSeconds: '30',
+              Prompt: '"Wait for build"',
+              TimerCondition: JSON.stringify(`${WORKER_CONV}/task-1`),
+            },
+          },
+          { name: 'schedule', args: { CronExpression: '"*/5 * * * *"', Prompt: '"cron heartbeat"' } },
+        ],
+      },
+      {
+        step_index: 4,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-2`,
+      },
+      {
+        step_index: 5,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-3`,
+      },
+      {
+        step_index: 6,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: recentIso,
+        content: `<SYSTEM_MESSAGE>\n[Message] sender=${WORKER_CONV}/task-1 content=Task id "${WORKER_CONV}/task-1" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>`,
+      },
+      { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, content: 'Build finished.' },
+    ]);
+    const condSummary = await summarizeMemberTranscript(tpCondCancelled, nowMs);
+    assert.equal(condSummary.pendingBackgroundCount, 0);
+    assert.equal(condSummary.runState, 'waiting');
+    assert.equal((await inspectSwarmContinuation({ dataDir: root, sessionId: COORD_CONV, nowMs })).active, false);
+    cases.push('schedule-timers-and-cron');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 assert.equal(DEFAULT_SWARM_WORKER_STALE_MS, 10 * 60 * 1000);
 console.log(JSON.stringify({ passed: true, suite: 'swarm-continuation', cases }));

@@ -2314,4 +2314,234 @@ await scenario(async ({ bridge, emitted, append, begin, observe }) => {
   assert.ok(emitted.some(e => e.params?.update?.content?.text === 'Handled both tasks.'));
 });
 
+// Case 21: One-shot schedule timers (fired directly OR silently cancelled via TimerCondition) resolve without leaking pendingTools.
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'run jobs with timers' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"export-job"', WaitMsBeforeAsync: '1' } }],
+    },
+    launch(2, 'task-97'),
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          name: 'schedule',
+          args: {
+            DurationSeconds: '10',
+            Prompt: '"Wait for export task-97"',
+            TimerCondition: JSON.stringify(`${id}/task-97`),
+          },
+        },
+      ],
+    },
+    launch(4, 'task-102'),
+    {
+      step_index: 5,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${id}/task-102 content=Wait for export task-97\n</SYSTEM_MESSAGE>`,
+    },
+    finished(6, 'task-97', 0),
+    {
+      step_index: 7,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"update-doc"', WaitMsBeforeAsync: '1' } }],
+    },
+    launch(8, 'task-149'),
+    {
+      step_index: 9,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          name: 'schedule',
+          args: {
+            DurationSeconds: '15',
+            Prompt: '"Wait for update task-149"',
+            TimerCondition: JSON.stringify(`${id}/task-149`),
+          },
+        },
+      ],
+    },
+    launch(10, 'task-151'),
+    // Reminder-only SYSTEM_MESSAGE without [Message] sender= must NOT prematurely cancel TimerCondition.
+    {
+      step_index: 11,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>',
+    },
+    finished(12, 'task-149', 0),
+    message(13, 'All exports and document updates verified.'),
+  ]);
+  await observe('call-job-97', 'export-job');
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-sched-102',
+        name: 'schedule',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { DurationSeconds: 10, Prompt: 'Wait for export task-97', TimerCondition: `${id}/task-97` },
+      },
+    },
+  });
+  await observe('call-job-149', 'update-doc');
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-sched-151',
+        name: 'schedule',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { DurationSeconds: 15, Prompt: 'Wait for update task-149', TimerCondition: `${id}/task-149` },
+      },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'All exports and document updates verified.' } },
+    },
+  });
+
+  const out = await bridge.fromAgent(response);
+  assert.equal(out.result?.stopReason, 'end_turn');
+  assert.ok(
+    emitted.some(
+      e =>
+        e.params?.update?.sessionUpdate === 'tool_call_update' &&
+        e.params.update.toolCallId === 'call-sched-102' &&
+        e.params.update.status === 'completed',
+    ),
+    'Fired schedule timer must be marked completed',
+  );
+  assert.ok(
+    emitted.some(
+      e =>
+        e.params?.update?.sessionUpdate === 'tool_call_update' &&
+        e.params.update.toolCallId === 'call-sched-151' &&
+        e.params.update.status === 'completed',
+    ),
+    'TimerCondition-cancelled schedule timer must be marked completed without leaking pendingTools',
+  );
+});
+
+// Case 22: Standalone one-shot schedule timer (no TimerCondition, no other bg task) holds drain until timer fires.
+await scenario(async ({ bridge, emitted, append, begin }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'wait for rollout' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'schedule', args: { DurationSeconds: '10', Prompt: '"check rollout"' } }],
+    },
+    launch(2, 'task-2'),
+    message(3, 'Waiting 10s for rollout.'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-sched-standalone',
+        name: 'schedule',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { DurationSeconds: 10, Prompt: 'check rollout' },
+      },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Waiting 10s for rollout.' } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(res => {
+    settled = true;
+    return res;
+  });
+  await delay(25);
+  assert.equal(settled, false, 'Standalone one-shot schedule timer must keep drain open until timer fires');
+
+  await append([
+    {
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${id}/task-2 content=check rollout\n</SYSTEM_MESSAGE>`,
+    },
+    message(5, 'Rollout verified.'),
+  ]);
+  const out = await done;
+  assert.equal(out.result?.stopReason, 'end_turn');
+  assert.ok(emitted.some(e => e.params?.update?.content?.text === 'Rollout verified.'));
+});
+
+// Case 23: Non-blocking RUNNING launches (IsDaemon / CronExpression) do not leak pendingTools,
+// while async run_workflow background tasks stay tracked until finished.
+await scenario(async ({ bridge, emitted, append, begin }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'start daemons and workflow' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'run_command', args: { CommandLine: '"dev-server"', IsDaemon: 'true' } },
+        { name: 'schedule', args: { CronExpression: '"*/5 * * * *"', Prompt: '"daemon tick"', IsDaemon: 'true' } },
+        { name: 'schedule', args: { CronExpression: '"*/5 * * * *"', Prompt: '"cron tick"' } },
+      ],
+    },
+    launch(2, 'task-20'),
+    launch(3, 'task-21'),
+    launch(4, 'task-22'),
+    {
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_workflow', args: { Description: '"audit fanout"', Script: '"pass"' } }],
+    },
+    launch(6, 'task-23'),
+    message(7, 'Workflow running.'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Workflow running.' } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(res => {
+    settled = true;
+    return res;
+  });
+  await delay(25);
+  assert.equal(settled, false, 'Async run_workflow background task must hold drain until completion');
+
+  await append([finished(8, 'task-23', 0), message(9, 'Workflow finished.')]);
+  const out = await done;
+  assert.equal(out.result?.stopReason, 'end_turn');
+  assert.ok(emitted.some(e => e.params?.update?.content?.text === 'Workflow finished.'));
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

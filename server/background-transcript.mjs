@@ -16,8 +16,45 @@ const SYSTEM_SUBAGENT_IDLE_RE = new RegExp(
 );
 const SYSTEM_TASK_DONE_RE =
   /content=Task id "([^"]+)" (?:was\s+)?(finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:\n([\s\S]*?)(?=\n\[Message\]|\n<\/SYSTEM_MESSAGE>|$)/gi;
+const BG_TASK_LAUNCH_RE = /(?:^|\n)Tool is running as a background task with task id: ([^\s]+)/;
+const SYSTEM_MESSAGE_RE =
+  /\[Message\][^\n]*\bsender=([^\s]+)(?:[^\n]*?\bcontent=([\s\S]*?))?(?=\n\[Message\]|\n<\/SYSTEM_MESSAGE>|$)/gi;
 const SERVER_RESTART_NOTICE_RE =
   /\bcontent=\[Notice\] All your subagents and background tasks have been stopped due to server restart\./;
+
+function matchesTaskOrSender(targetId, candidate) {
+  const target = typeof targetId === 'string' ? targetId.trim().toLowerCase() : '';
+  const cand = typeof candidate === 'string' ? candidate.trim().toLowerCase() : '';
+  if (!target || !cand) return false;
+  return target === cand || target.endsWith(`/${cand}`) || cand.endsWith(`/${target}`);
+}
+
+function classifyBackgroundLaunch(ref, row, content, sessionId) {
+  if (row.status !== 'RUNNING') return null;
+  const rawTaskId = BG_TASK_LAUNCH_RE.exec(header(content))?.[1];
+  if (
+    !rawTaskId ||
+    !rawTaskId.startsWith(`${sessionId}/task-`) ||
+    !/^task-\d+$/.test(rawTaskId.slice(sessionId.length + 1))
+  ) {
+    return null;
+  }
+  if (ref.name === 'run_command' && ref.input?.IsDaemon === true) {
+    return { kind: 'non-blocking', taskId: rawTaskId };
+  }
+  if (ref.name === 'schedule') {
+    const isDaemon = ref.input?.IsDaemon === true;
+    const hasCron = typeof ref.input?.CronExpression === 'string' && ref.input.CronExpression.trim().length > 0;
+    const duration = Number(ref.input?.DurationSeconds);
+    if (isDaemon || hasCron || !(Number.isFinite(duration) && duration > 0)) {
+      return { kind: 'non-blocking', taskId: rawTaskId };
+    }
+    const rawCond = typeof ref.input?.TimerCondition === 'string' ? ref.input.TimerCondition.trim() : '';
+    const condition = !rawCond || rawCond.toLowerCase() === 'never' ? null : rawCond;
+    return { kind: 'timer', taskId: rawTaskId, condition };
+  }
+  return { kind: 'task', taskId: rawTaskId };
+}
 
 // Read only additions, and recover if AGY replaces or rewrites its JSONL snapshot.
 export class TranscriptTail {
@@ -394,6 +431,7 @@ export class BackgroundProjection {
     const queue = [];
     const pending = new Map();
     const tasks = new Map();
+    const timers = new Map();
     const knownSubagents = new Map();
     const subagents = new Map();
     const settledSubagents = new Map();
@@ -433,10 +471,25 @@ export class BackgroundProjection {
       markForegroundToolClosed(ref, status);
     };
 
+    const cancelMatchingTimers = (senderOrTaskId, reasonContent) => {
+      for (const [timerTaskId, timerEntry] of [...timers.entries()]) {
+        if (!timerEntry.condition) continue;
+        if (
+          timerEntry.condition.toLowerCase() === 'any' ||
+          matchesTaskOrSender(timerEntry.condition, senderOrTaskId)
+        ) {
+          timers.delete(timerTaskId);
+          tasks.delete(timerTaskId);
+          complete(timerEntry.ref, reasonContent, false);
+        }
+      }
+    };
+
     const settleSubagent = (subId, output, failed = false) => {
       const entry = subagents.get(subId) ?? knownSubagents.get(subId);
       subagents.delete(subId);
       if (entry) settledSubagents.set(entry.ref.key, { ref: entry.ref, subId, output, failed });
+      cancelMatchingTimers(subId, output);
     };
 
     for (const row of rows) {
@@ -523,21 +576,21 @@ export class BackgroundProjection {
         genericsSinceLastPlanner.push(row);
         const ref = queue.shift();
         const content = row.content ?? '';
-        const isDaemon = ref.name === 'run_command' && ref.input?.IsDaemon === true;
-        const task =
-          ref.name === 'run_command' && !isDaemon
-            ? /(?:^|\n)Tool is running as a background task with task id: ([^\s]+)/.exec(header(content))?.[1]
-            : undefined;
+        const bgLaunch = classifyBackgroundLaunch(ref, row, content, this.sessionId);
         const createdSubId =
           ref.name === 'invoke_subagent' && row.status === 'DONE'
             ? CREATED_SUBAGENT_RE.exec(content)?.[1]?.toLowerCase()
             : undefined;
-        if (
-          task?.startsWith(this.sessionId + '/task-') &&
-          /^task-\d+$/.test(task.slice(this.sessionId.length + 1))
-        ) {
+        if (bgLaunch?.kind === 'non-blocking') {
+          if (ref.raw?.status === 'completed' || ref.raw?.status === 'failed') pending.delete(ref.key);
+          else complete(ref, content, false);
+        } else if (bgLaunch?.kind === 'timer') {
           seenBackground = true;
-          tasks.set(task, ref);
+          tasks.set(bgLaunch.taskId, ref);
+          timers.set(bgLaunch.taskId, { ref, condition: bgLaunch.condition });
+        } else if (bgLaunch?.kind === 'task') {
+          seenBackground = true;
+          tasks.set(bgLaunch.taskId, ref);
         } else if (createdSubId) {
           seenBackground = true;
           pending.delete(ref.key);
@@ -558,13 +611,13 @@ export class BackgroundProjection {
             const action = ref.input?.Action;
             const rawTarget = typeof ref.input?.TaskId === 'string' ? ref.input.TaskId.trim() : '';
             if (action === 'kill' && rawTarget) {
-              const targetLower = rawTarget.toLowerCase();
               for (const [taskId, taskRef] of [...tasks.entries()]) {
-                const lower = taskId.toLowerCase();
-                if (lower === targetLower || lower.endsWith(`/${targetLower}`)) {
+                if (matchesTaskOrSender(taskId, rawTarget)) {
                   tasks.delete(taskId);
+                  timers.delete(taskId);
                   lastWake = Math.max(lastWake, row.step_index);
                   complete(taskRef, content, true);
+                  cancelMatchingTimers(taskId, content);
                 }
               }
             }
@@ -627,9 +680,23 @@ export class BackgroundProjection {
           const ref = matchedKey ? tasks.get(matchedKey) : undefined;
           if (ref) {
             tasks.delete(matchedKey);
+            timers.delete(matchedKey);
             lastWake = Math.max(lastWake, row.step_index);
             complete(ref, match[3], !['finished', 'completed'].includes(match[2].toLowerCase()));
           }
+        }
+        for (const msgMatch of content.matchAll(SYSTEM_MESSAGE_RE)) {
+          const sender = msgMatch[1];
+          const msgContent = (msgMatch[2] ?? '').trim();
+          for (const [timerTaskId, timerEntry] of [...timers.entries()]) {
+            if (matchesTaskOrSender(timerTaskId, sender)) {
+              timers.delete(timerTaskId);
+              tasks.delete(timerTaskId);
+              lastWake = Math.max(lastWake, row.step_index);
+              complete(timerEntry.ref, msgContent || 'Timer fired', false);
+            }
+          }
+          cancelMatchingTimers(sender, msgContent || 'Timer cancelled by matching message');
         }
         const directSub = DIRECT_SUBAGENT_MSG_RE.exec(content);
         if (directSub && knownSubagents.has(directSub[1].toLowerCase())) {
@@ -644,7 +711,8 @@ export class BackgroundProjection {
           settleSubagent(subId, report, canceled);
           lastWake = Math.max(lastWake, row.step_index);
         }
-        if (SERVER_RESTART_NOTICE_RE.test(content) && (tasks.size > 0 || subagents.size > 0)) {
+        if (SERVER_RESTART_NOTICE_RE.test(content) && (tasks.size > 0 || subagents.size > 0 || timers.size > 0)) {
+          timers.clear();
           for (const [taskId, taskRef] of [...tasks.entries()]) {
             tasks.delete(taskId);
             complete(taskRef, 'Stopped due to server restart', true);
