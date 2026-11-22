@@ -8,7 +8,7 @@ const BG_TASK_LAUNCH_RE = new RegExp(
   'i',
 );
 const BG_TASK_DONE_RE =
-  /content=Task id "([^"]+)" (?:finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:/g;
+  /content=Task id "([^"]+)" (?:was\s+)?(?:finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:/gi;
 const CREATED_SUBAGENT_RE = new RegExp(
   `(?:^|\\n)Created the following subagent:\\s*\\{[\\s\\S]*?"conversationId"\\s*:\\s*"(${UUID_PATTERN})"`,
   'i',

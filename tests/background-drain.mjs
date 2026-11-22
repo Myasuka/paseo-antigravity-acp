@@ -2148,4 +2148,170 @@ await scenario(async ({ bridge, emitted }) => {
   );
 });
 
+// Case 18: Killing a background task via manage_task(Action: "kill") + passive "was canceled with result:" SYSTEM_MESSAGE
+// settles immediately when the foreground turn ends without stalling BackgroundDrain.
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'search' },
+    tool(1, 'broad-grep'),
+    launch(2, 'task-148'),
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'manage_task', args: { Action: '"kill"', TaskId: JSON.stringify(`${id}/task-148`) } }],
+    },
+    {
+      step_index: 4,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Created At: now\nCompleted At: now\nTask "${id}/task-148" cancelled.`,
+    },
+    {
+      step_index: 5,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${id}/task-148 content=Task id "${id}/task-148" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>`,
+    },
+    message(6, 'Narrowed search and answered.'),
+  ]);
+  await observe('call-kill-1', 'broad-grep');
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-manage-1',
+        name: 'manage_task',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { Action: 'kill', TaskId: `${id}/task-148` },
+      },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-manage-1', status: 'completed' },
+    },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: {
+      sessionId: id,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Narrowed search and answered.' } },
+    },
+  });
+
+  const out = await bridge.fromAgent(response);
+  assert.equal(out.result?.stopReason, 'end_turn');
+  const bgToolFailed = emitted.find(
+    e =>
+      e.params?.update?.sessionUpdate === 'tool_call_update' &&
+      e.params.update.toolCallId === 'call-kill-1' &&
+      e.params.update.status === 'failed',
+  );
+  assert.ok(bgToolFailed, 'Killed foreground background task must be marked failed');
+});
+
+// Case 19: Passive "was canceled with result:" SYSTEM_MESSAGE alone (without manage_task) resolves a draining background task.
+await scenario(async ({ bridge, emitted, append, begin, foreground }) => {
+  await begin();
+  await foreground();
+  const done = bridge.fromAgent(response);
+  await delay(20);
+  await append([
+    {
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${id}/task-2 content=Task id "${id}/task-2" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>`,
+    },
+    message(5, 'Recovered after cancellation.'),
+  ]);
+  const out = await done;
+  assert.equal(out.result?.stopReason, 'end_turn');
+  const fgFailed = emitted.find(
+    e =>
+      e.params?.update?.sessionUpdate === 'tool_call_update' &&
+      e.params.update.toolCallId === 'call-1' &&
+      e.params.update.status === 'failed',
+  );
+  assert.ok(fgFailed, 'Background task canceled via passive SYSTEM_MESSAGE must mark tool failed');
+  assert.ok(
+    emitted.some(e => e.params?.update?.content?.text === 'Recovered after cancellation.'),
+    'Planner recovery message after cancellation should be drained',
+  );
+});
+
+// Case 20: Multiple background task notifications inside one SYSTEM_MESSAGE (one finished, one was canceled) both settle.
+await scenario(async ({ bridge, emitted, append, begin, observe }) => {
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'two tasks' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'run_command', args: { CommandLine: '"task-a"', WaitMsBeforeAsync: '1' } },
+        { name: 'run_command', args: { CommandLine: '"task-b"', WaitMsBeforeAsync: '1' } },
+      ],
+    },
+    launch(2, 'task-10'),
+    launch(3, 'task-11'),
+    message(4, 'Both running'),
+  ]);
+  await observe('call-multi-a', 'task-a');
+  await observe('call-multi-b', 'task-b');
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Both running' } } },
+  });
+
+  const done = bridge.fromAgent(response);
+  await delay(20);
+  await append([
+    {
+      step_index: 5,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: [
+        '<SYSTEM_MESSAGE>',
+        `[Message] sender=${id}/task-10 content=Task id "${id}/task-10" finished with result:`,
+        'Command exited with code 0.',
+        '',
+        'Command output:',
+        'OK',
+        `[Message] sender=${id}/task-11 content=Task id "${id}/task-11" was canceled with result:`,
+        'Tool execution was canceled',
+        '</SYSTEM_MESSAGE>',
+      ].join('\n'),
+    },
+    message(6, 'Handled both tasks.'),
+  ]);
+  const out = await done;
+  assert.equal(out.result?.stopReason, 'end_turn');
+  assert.ok(
+    emitted.some(
+      e =>
+        e.params?.update?.sessionUpdate === 'tool_call_update' &&
+        e.params.update.toolCallId === 'call-multi-a' &&
+        e.params.update.status === 'completed',
+    ),
+  );
+  assert.ok(
+    emitted.some(
+      e =>
+        e.params?.update?.sessionUpdate === 'tool_call_update' &&
+        e.params.update.toolCallId === 'call-multi-b' &&
+        e.params.update.status === 'failed',
+    ),
+  );
+  assert.ok(emitted.some(e => e.params?.update?.content?.text === 'Handled both tasks.'));
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

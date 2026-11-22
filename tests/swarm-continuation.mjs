@@ -859,5 +859,68 @@ const nowMs = Date.parse('2026-06-01T12:00:00.000Z');
   }
 }
 
+// 14. Worker background task terminated via passive "was canceled with result:" SYSTEM_MESSAGE clears pendingBackgroundCount.
+{
+  const root = await mkdtemp(join(tmpdir(), 'agy-swarm-cont-14-'));
+  try {
+    const recentIso = new Date(nowMs - 10 * 1000).toISOString();
+    await writeSwarm(root, {
+      members: {
+        worker: {
+          conversation_id: WORKER_CONV,
+          role: 'worker',
+          phase: 'WAITING',
+          wake_mode: 'mentions',
+          last_read_seq: 1,
+          killed: false,
+        },
+      },
+      posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@worker check', time: recentIso }],
+    });
+    const workerTranscriptPath = await writeTranscript(root, WORKER_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'check' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [{ name: 'run_command', args: { CommandLine: '"slow-grep"' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-1`,
+      },
+      {
+        step_index: 3,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: recentIso,
+        content: `<SYSTEM_MESSAGE>\n[Message] sender=${WORKER_CONV}/task-1 content=Task id "${WORKER_CONV}/task-1" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        content: 'Done.',
+      },
+    ]);
+
+    const summary = await summarizeMemberTranscript(workerTranscriptPath, nowMs);
+    assert.equal(summary.pendingBackgroundCount, 0);
+    assert.equal(summary.runState, 'waiting');
+
+    const state = await inspectSwarmContinuation({ dataDir: root, sessionId: COORD_CONV, nowMs });
+    assert.equal(state.active, false);
+    assert.deepEqual(state.activeWorkerConversations, []);
+    cases.push('passive-was-canceled-clears-pending-background');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 assert.equal(DEFAULT_SWARM_WORKER_STALE_MS, 10 * 60 * 1000);
 console.log(JSON.stringify({ passed: true, suite: 'swarm-continuation', cases }));

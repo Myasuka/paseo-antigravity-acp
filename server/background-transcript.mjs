@@ -14,6 +14,8 @@ const SYSTEM_SUBAGENT_IDLE_RE = new RegExp(
   `\\bcontent=Subagent "?(${UUID_PATTERN})"? (has gone idle\\. This was the subagent's most recent response:\\s*([\\s\\S]*?)|went idle without reporting anything back[\\s\\S]*?|has been explicitly canceled[\\s\\S]*?)(?:\\n<\\/SYSTEM_MESSAGE>|$)`,
   'gi',
 );
+const SYSTEM_TASK_DONE_RE =
+  /content=Task id "([^"]+)" (?:was\s+)?(finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:\n([\s\S]*?)(?=\n\[Message\]|\n<\/SYSTEM_MESSAGE>|$)/gi;
 const SERVER_RESTART_NOTICE_RE =
   /\bcontent=\[Notice\] All your subagents and background tasks have been stopped due to server restart\./;
 
@@ -552,6 +554,20 @@ export class BackgroundProjection {
               subagents.set(recipient, target);
               settledSubagents.delete(target.ref.key);
             }
+          } else if (ref.name === 'manage_task' && row.status === 'DONE') {
+            const action = ref.input?.Action;
+            const rawTarget = typeof ref.input?.TaskId === 'string' ? ref.input.TaskId.trim() : '';
+            if (action === 'kill' && rawTarget) {
+              const targetLower = rawTarget.toLowerCase();
+              for (const [taskId, taskRef] of [...tasks.entries()]) {
+                const lower = taskId.toLowerCase();
+                if (lower === targetLower || lower.endsWith(`/${targetLower}`)) {
+                  tasks.delete(taskId);
+                  lastWake = Math.max(lastWake, row.step_index);
+                  complete(taskRef, content, true);
+                }
+              }
+            }
           } else if (ref.name === 'manage_subagents' && row.status === 'DONE') {
             const action = ref.input?.Action;
             if (action === 'kill_all' && subagents.size > 0) {
@@ -603,15 +619,17 @@ export class BackgroundProjection {
           lastWake = Math.max(lastWake, row.step_index);
         }
         const content = row.content ?? '';
-        const match =
-          /content=Task id "([^"]+)" (finished|completed|failed|stopped|killed|terminated|canceled|cancelled) with result:\n([\s\S]*?)(?:\n<\/SYSTEM_MESSAGE>|$)/.exec(
-            content,
-          );
-        const ref = match && tasks.get(match[1]);
-        if (ref) {
-          tasks.delete(match[1]);
-          lastWake = Math.max(lastWake, row.step_index);
-          complete(ref, match[3], !['finished', 'completed'].includes(match[2]));
+        for (const match of content.matchAll(SYSTEM_TASK_DONE_RE)) {
+          const rawTaskId = match[1];
+          const matchedKey = tasks.has(rawTaskId)
+            ? rawTaskId
+            : [...tasks.keys()].find(key => key.toLowerCase() === rawTaskId.toLowerCase());
+          const ref = matchedKey ? tasks.get(matchedKey) : undefined;
+          if (ref) {
+            tasks.delete(matchedKey);
+            lastWake = Math.max(lastWake, row.step_index);
+            complete(ref, match[3], !['finished', 'completed'].includes(match[2].toLowerCase()));
+          }
         }
         const directSub = DIRECT_SUBAGENT_MSG_RE.exec(content);
         if (directSub && knownSubagents.has(directSub[1].toLowerCase())) {
