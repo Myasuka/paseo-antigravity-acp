@@ -40,6 +40,162 @@ function wait(ms, signal) {
   });
 }
 
+function formatProgressBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1024) return `${Math.round(bytes)}B`;
+  if (bytes < 1024 * 1024) {
+    const kb = (bytes / 1024).toFixed(1).replace(/\.0$/, '');
+    return `${kb}KB`;
+  }
+  const mb = (bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, '');
+  return `${mb}MB`;
+}
+
+function formatActivityClock(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return null;
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export function formatSwarmProgress(progress, { phase = 'running', note } = {}) {
+  if (!progress) {
+    const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 110) : '';
+    const label = phase === 'failed' ? `Failed · ${cleanNote || 'Swarm continuation failed'}` : 'Settled';
+    const text = cleanNote ? `Swarm status: ${label}\n${cleanNote}` : `Swarm status: ${label}`;
+    const key = `empty:${phase}:${cleanNote}`;
+    return { label: label.slice(0, 140), text, structuralKey: key, digest: key };
+  }
+
+  const clock = formatActivityClock(progress.lastActivityMs);
+  const workers = Array.isArray(progress.workers) ? progress.workers : [];
+  const activeWorkers = workers.filter(worker => worker.status === 'active');
+  const staleWorkers = workers.filter(worker => worker.status === 'stale');
+  const waitingWorkers = workers.filter(worker => worker.status === 'waiting');
+
+  const summaryParts = [];
+  if (phase === 'settled') {
+    summaryParts.push('Settled');
+    if (progress.waitingCount > 0) summaryParts.push(`${progress.waitingCount} waiting`);
+    if (progress.headSeq > 0) summaryParts.push(`#${progress.headSeq}`);
+  } else if (phase === 'paused') {
+    summaryParts.push('Guidance sent');
+    if (progress.activeCount > 0) summaryParts.push(`${progress.activeCount} active`);
+    if (progress.headSeq > 0) summaryParts.push(`#${progress.headSeq}`);
+  } else if (phase === 'failed') {
+    summaryParts.push('Failed');
+    summaryParts.push((note ?? 'Swarm continuation failed').trim().slice(0, 96));
+  } else {
+    if (progress.awaitingApproval) summaryParts.push('Approval needed');
+    if (progress.activeCount > 0) summaryParts.push(`${progress.activeCount} active`);
+    else if (progress.hasPendingWakeup) summaryParts.push('Waking coordinator');
+    else summaryParts.push('Waiting');
+    if (progress.waitingCount > 0) summaryParts.push(`${progress.waitingCount} waiting`);
+    if (progress.staleCount > 0) summaryParts.push(`${progress.staleCount} stale`);
+    if (progress.headSeq > 0) summaryParts.push(`#${progress.headSeq}`);
+    if (activeWorkers.length > 0) {
+      const preview = activeWorkers.slice(0, 2).map(worker => {
+        const bytesLabel = formatProgressBytes(worker.taskLogBytes);
+        const hint = worker.activity
+          ? worker.activity.replace(/^run_command(?:\s*\([^)]+\))?:\s*/i, '').trim().slice(0, 28)
+          : '';
+        if (hint && bytesLabel) return `@${worker.name} (${hint} · ${bytesLabel})`;
+        if (bytesLabel) return `@${worker.name} (${bytesLabel})`;
+        if (hint) return `@${worker.name} (${hint})`;
+        return `@${worker.name}`;
+      });
+      const extra = activeWorkers.length > 2 ? ` +${activeWorkers.length - 2}` : '';
+      summaryParts.push(preview.join(', ') + extra);
+    }
+    if (clock) summaryParts.push(clock);
+  }
+  const label = summaryParts.join(' · ').slice(0, 140);
+
+  const workerMeta = worker => {
+    const meta = [];
+    const bytesLabel = formatProgressBytes(worker.taskLogBytes);
+    if (bytesLabel) meta.push(`log ${bytesLabel}`);
+    else if (worker.steps > 0) meta.push(`step ${worker.steps}`);
+    const workerClock = formatActivityClock(worker.lastActivityMs);
+    if (workerClock) meta.push(workerClock);
+    return meta.length > 0 ? ` [${meta.join(', ')}]` : '';
+  };
+
+  const headerMeta = [
+    `board #${progress.headSeq ?? 0}`,
+    clock ? `last activity ${clock}` : null,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  const lines = [`Swarm${progress.title ? `: ${progress.title}` : ''} (${headerMeta})`];
+  if (phase === 'failed' && note) {
+    lines.push(`Error: ${note}`);
+  }
+  if (activeWorkers.length > 0) {
+    lines.push(`Active (${activeWorkers.length}):`);
+    for (const worker of activeWorkers) {
+      const detail = worker.activity ?? (worker.awaitingApproval ? 'awaiting approval' : 'working');
+      lines.push(`- @${worker.name}: ${detail}${workerMeta(worker)}`);
+    }
+  }
+  if (staleWorkers.length > 0) {
+    lines.push(`Stale (${staleWorkers.length}):`);
+    for (const worker of staleWorkers) {
+      const detail = worker.failure ? `error: ${worker.failure}` : (worker.activity ?? 'idle without progress');
+      lines.push(`- @${worker.name}: [stale] ${detail}${workerMeta(worker)}`);
+    }
+  }
+  if (waitingWorkers.length > 0) {
+    const withFailures = waitingWorkers.filter(worker => worker.failure);
+    if (withFailures.length > 0) {
+      lines.push(`Waiting (${waitingWorkers.length}):`);
+      for (const worker of waitingWorkers) {
+        lines.push(`- @${worker.name}: ${worker.failure ? `error: ${worker.failure}` : 'waiting'}${workerMeta(worker)}`);
+      }
+    } else {
+      lines.push(`Waiting (${waitingWorkers.length}): ${waitingWorkers.map(worker => `@${worker.name}`).join(', ')}`);
+    }
+  }
+  if (progress.latestPost) {
+    const ch =
+      progress.latestPost.channel && progress.latestPost.channel !== 'main' ? ` #${progress.latestPost.channel}` : '';
+    lines.push(
+      `Latest board (#${progress.latestPost.seq} @${progress.latestPost.agent}${ch}): ${progress.latestPost.preview}`,
+    );
+  }
+
+  const structuralKey = [
+    phase,
+    progress.activeCount,
+    progress.waitingCount,
+    progress.staleCount,
+    progress.hasPendingWakeup,
+    progress.awaitingApproval,
+    progress.headSeq,
+    workers
+      .map(worker => `${worker.name}:${worker.status}:${worker.activity ?? ''}:${worker.failure ?? ''}`)
+      .join(','),
+  ].join('|');
+
+  const digest = [
+    structuralKey,
+    workers
+      .map(
+        worker =>
+          `${worker.name}:${worker.steps}:${Math.floor((worker.taskLogBytes ?? 0) / 1024)}:${worker.lastActivityMs ? Math.floor(worker.lastActivityMs / 1000) : 0}`,
+      )
+      .join(','),
+  ].join('|');
+
+  return {
+    label,
+    text: lines.join('\n'),
+    structuralKey,
+    digest,
+  };
+}
+
 async function readLastTranscriptRowFromPath(path) {
   let file;
   try {
@@ -78,6 +234,7 @@ async function readLastTranscriptRow(path) {
 export class BackgroundDrain {
   constructor({
     emit,
+    writeUpstream = null,
     dataDir,
     pollMs = 250,
     settleMs = 750,
@@ -87,12 +244,14 @@ export class BackgroundDrain {
     swarmWakeupGraceMs = 15000,
     swarmWorkerStaleMs = DEFAULT_SWARM_WORKER_STALE_MS,
     preExistingSwarmWorkerStaleMs = 2 * 60 * 1000,
+    swarmProgressThrottleMs = 1500,
     nativeFull = process.env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
     loadSettleMs = 400,
     loadMaxWaitMs = 15000,
     loadMetaFlushDelayMs = 15,
   }) {
     this.emit = emit;
+    this.writeUpstream = typeof writeUpstream === 'function' ? writeUpstream : null;
     this.dataDir =
       dataDir ??
       resolve(
@@ -111,15 +270,193 @@ export class BackgroundDrain {
     this.swarmWakeupGraceMs = swarmWakeupGraceMs;
     this.swarmWorkerStaleMs = swarmWorkerStaleMs;
     this.preExistingSwarmWorkerStaleMs = preExistingSwarmWorkerStaleMs;
+    this.swarmProgressThrottleMs = swarmProgressThrottleMs;
     this.nativeFull = nativeFull;
     this.loadSettleMs = loadSettleMs;
     this.loadMaxWaitMs = loadMaxWaitMs;
     this.loadMetaFlushDelayMs = loadMetaFlushDelayMs;
     this.requests = new Map();
+    this.steerRequests = new Map();
+    this.steerSeq = 0;
+    this.roundSeq = 0;
     this.permissions = new Map();
     this.sessions = new Map();
     this.agentLane = Promise.resolve();
     this.closed = false;
+  }
+
+  isDeferredPromptResponse(message) {
+    return Boolean(
+      message &&
+        !message.method &&
+        'id' in message &&
+        this.requests.get(message.id)?.method === 'session/prompt',
+    );
+  }
+
+  canSteer(sessionId) {
+    if (this.closed || !this.writeUpstream) return false;
+    const round = this.sessions.get(sessionId)?.round;
+    if (!round || !round.draining || round.controller.signal.aborted || round.steerInFlight) {
+      return false;
+    }
+    for (const permSessionId of this.permissions.values()) {
+      if (permSessionId === sessionId) return false;
+    }
+    return true;
+  }
+
+  updateSwarmProgressCard(sessionId, round, swarmState, nowMs = Date.now()) {
+    if (!swarmState?.exists || !swarmState.progress) return;
+    const progress = swarmState.progress;
+    const formatted = formatSwarmProgress(progress, { phase: 'running' });
+    if (!round.swarmProgress) {
+      const toolCallId = `agy:${sessionId}:swarm-progress:${round.id}:${++round.progressCardSeq}`;
+      round.swarmProgress = {
+        toolCallId,
+        lastDigest: formatted.digest,
+        lastStructuralKey: formatted.structuralKey,
+        lastEmittedAt: nowMs,
+      };
+      this.emit({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            name: 'swarm_progress',
+            title: 'Swarm progress',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput: {
+              label: formatted.label,
+              active: progress.activeCount,
+              waiting: progress.waitingCount,
+              headSeq: progress.headSeq,
+            },
+            rawOutput: { output: formatted.text, label: formatted.label },
+          },
+        },
+      });
+      return;
+    }
+    const entry = round.swarmProgress;
+    if (formatted.digest === entry.lastDigest) return;
+    const structuralChange = formatted.structuralKey !== entry.lastStructuralKey;
+    if (!structuralChange && nowMs - entry.lastEmittedAt < this.swarmProgressThrottleMs) {
+      return;
+    }
+    entry.lastDigest = formatted.digest;
+    entry.lastStructuralKey = formatted.structuralKey;
+    entry.lastEmittedAt = nowMs;
+    this.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: entry.toolCallId,
+          status: 'in_progress',
+          rawInput: {
+            label: formatted.label,
+            active: progress.activeCount,
+            waiting: progress.waitingCount,
+            headSeq: progress.headSeq,
+          },
+          rawOutput: { output: formatted.text, label: formatted.label },
+        },
+      },
+    });
+  }
+
+  finalizeSwarmProgressCard(sessionId, round, swarmState, { status = 'completed', phase = 'settled', note } = {}) {
+    if (!round?.swarmProgress) return;
+    const entry = round.swarmProgress;
+    round.swarmProgress = null;
+    const progress = swarmState?.progress ?? null;
+    const formatted = formatSwarmProgress(progress, { phase, note });
+    this.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: entry.toolCallId,
+          status,
+          rawInput: {
+            label: formatted.label,
+            ...(progress
+              ? { active: progress.activeCount, waiting: progress.waitingCount, headSeq: progress.headSeq }
+              : {}),
+          },
+          rawOutput: { output: formatted.text, label: formatted.label },
+        },
+      },
+    });
+  }
+
+  async steer(sessionId, promptBlocks) {
+    if (!this.canSteer(sessionId)) return false;
+    const session = this.sessions.get(sessionId);
+    const round = session?.round;
+    if (!round) return false;
+    const steerId = `agy-steer:${++this.steerSeq}`;
+    round.steerInFlight = { id: steerId, startedAt: Date.now() };
+    let preSteerUserInputs = 0;
+    try {
+      round.projection.add(await round.tail.read());
+      if (this.closed || session.round !== round || !round.draining || round.controller.signal.aborted) {
+        round.steerInFlight = null;
+        return false;
+      }
+      round.projection.inspect({ publish: true });
+      for (const row of round.projection.rows.values()) {
+        if (row.type === 'USER_INPUT') preSteerUserInputs++;
+      }
+    } catch {
+      round.steerInFlight = null;
+      return false;
+    }
+
+    const steerMeta = { sessionId, round, preSteerUserInputs };
+    this.steerRequests.set(steerId, steerMeta);
+    try {
+      this.writeUpstream({
+        jsonrpc: '2.0',
+        id: steerId,
+        method: 'session/prompt',
+        params: { sessionId, prompt: promptBlocks },
+      });
+    } catch {
+      this.steerRequests.delete(steerId);
+      round.steerInFlight = null;
+      return false;
+    }
+
+    round.steered = true;
+    round.projection.beginSteer();
+    if (round.swarmProgress) {
+      this.finalizeSwarmProgressCard(sessionId, round, round.lastSwarmState, {
+        status: 'completed',
+        phase: 'paused',
+      });
+    }
+    this.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: '' },
+        },
+      },
+    });
+    return true;
   }
 
   ensureSession(sessionId) {
@@ -444,11 +781,18 @@ export class BackgroundDrain {
         });
       }
       session.round = {
+        id: ++this.roundSeq,
         tail,
         projection: new BackgroundProjection(params.sessionId, this.emit),
         controller: new AbortController(),
         swarmBaseline,
         observedSwarmWorkers,
+        draining: false,
+        steered: false,
+        steerInFlight: null,
+        swarmProgress: null,
+        progressCardSeq: 0,
+        lastSwarmState: null,
       };
     }
     if ('id' in message) this.requests.set(message.id, { method: message.method, sessionId: params.sessionId });
@@ -469,6 +813,9 @@ export class BackgroundDrain {
       return run;
     }
     if ('id' in message && !message.method) {
+      if (this.steerRequests.has(message.id)) {
+        return this.agentLane.then(() => this._fromAgent(message));
+      }
       const reqMethod = this.requests.get(message.id)?.method;
       if (reqMethod === 'session/prompt' || reqMethod === 'session/load') {
         // Wait for queued session/update reads before draining end_turn or arming session/load quiescence,
@@ -481,6 +828,7 @@ export class BackgroundDrain {
 
   isUnchangedPreExistingSwarmStale(state, round, swarmState, nowMs = Date.now()) {
     if (!(this.preExistingSwarmWorkerStaleMs > 0)) return false;
+    if (round?.steered) return false;
     if (
       state.seenSwarm ||
       state.seenBackground ||
@@ -538,6 +886,51 @@ export class BackgroundDrain {
       return message;
     }
     if (!('id' in message) || message.method) return message;
+    const steerReq = this.steerRequests.get(message.id);
+    if (steerReq) {
+      this.steerRequests.delete(message.id);
+      const session = this.sessions.get(steerReq.sessionId);
+      const activeRound = session?.round === steerReq.round ? steerReq.round : null;
+      if (activeRound) {
+        try {
+          activeRound.projection.add(await activeRound.tail.read());
+          activeRound.projection.flushCompletedForegroundTools();
+          activeRound.projection.inspect({ publish: false });
+          if (message.error) {
+            let actualInputs = 0;
+            for (const row of activeRound.projection.rows.values()) {
+              if (row.type === 'USER_INPUT') actualInputs++;
+            }
+            if (actualInputs <= steerReq.preSteerUserInputs && activeRound.projection.expectedUserInputs > 1) {
+              activeRound.projection.expectedUserInputs -= 1;
+            }
+          }
+        } catch {}
+        if (message.error && !activeRound.controller.signal.aborted) {
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: steerReq.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: {
+                  type: 'text',
+                  text: `\n\n[Mid-turn guidance failed: ${message.error.message ?? 'unknown error'}]`,
+                },
+              },
+            },
+          });
+        }
+        if (activeRound.steerInFlight?.id === message.id) {
+          activeRound.steerInFlight = null;
+        }
+      }
+      return null;
+    }
+    if (typeof message.id === 'string' && message.id.startsWith('agy-steer:') && !this.requests.has(message.id)) {
+      return null;
+    }
     const request = this.requests.get(message.id);
     this.requests.delete(message.id);
     if (request?.method === 'session/load') {
@@ -581,11 +974,23 @@ export class BackgroundDrain {
         this.recordRoundReplay(session, round);
         return message;
       }
+      round.draining = true;
+      round.projection.freezeUsageForegroundEnd();
       const deadline = Date.now() + this.timeoutMs;
       let idleSince;
       let approvalStallSince;
       let subagentFailureSince;
       while (!round.controller.signal.aborted) {
+        if (round.steerInFlight) {
+          idleSince = undefined;
+          approvalStallSince = undefined;
+          subagentFailureSince = undefined;
+          if (Date.now() >= deadline) {
+            throw new Error('Timed out waiting for AGY background work to finish; its final result has not been confirmed');
+          }
+          await wait(this.pollMs, round.controller.signal);
+          continue;
+        }
         state = round.projection.inspect({ publish: true });
         if (state.foreignInput) return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
         if (state.failure) throw new Error(state.failure);
@@ -598,8 +1003,12 @@ export class BackgroundDrain {
           workerStaleMs: this.swarmWorkerStaleMs,
           observedWorkers: round.observedSwarmWorkers,
         });
+        round.lastSwarmState = swarmState;
         const effectiveSwarmActive =
           swarmState.active && !this.isUnchangedPreExistingSwarmStale(state, round, swarmState, loopNowMs);
+        if (swarmState.exists && (effectiveSwarmActive || round.swarmProgress)) {
+          this.updateSwarmProgressCard(request.sessionId, round, swarmState, loopNowMs);
+        }
         const subStatus = await this.inspectActiveSubagents(state.activeSubagents);
         if (subStatus.terminalFailure) {
           subagentFailureSince ??= Date.now();
@@ -629,6 +1038,16 @@ export class BackgroundDrain {
         if (state.coordinatorSettled && !effectiveSwarmActive) {
           idleSince ??= Date.now();
           if (Date.now() - idleSince >= this.settleMs) {
+            if (round.steerInFlight) {
+              idleSince = undefined;
+              await wait(this.pollMs, round.controller.signal);
+              continue;
+            }
+            round.draining = false;
+            this.finalizeSwarmProgressCard(request.sessionId, round, swarmState, {
+              status: 'completed',
+              phase: 'settled',
+            });
             const result = structuredClone(message);
             if (result.result.usage) {
               for (const [key, delta] of Object.entries(state.extraUsage)) {
@@ -649,12 +1068,22 @@ export class BackgroundDrain {
       }
       return { ...message, result: { ...message.result, stopReason: 'cancelled' } };
     } catch (error) {
+      this.finalizeSwarmProgressCard(request.sessionId, round, round.lastSwarmState, {
+        status: 'failed',
+        phase: 'failed',
+        note: error.message,
+      });
       return {
         jsonrpc: '2.0',
         id: message.id,
         error: { code: -32000, message: `AGY background continuation failed: ${error.message}` },
       };
     } finally {
+      round.draining = false;
+      round.steerInFlight = null;
+      for (const [steerId, entry] of this.steerRequests.entries()) {
+        if (entry.round === round) this.steerRequests.delete(steerId);
+      }
       if (session.round === round) session.round = null;
     }
   }
@@ -672,6 +1101,7 @@ export class BackgroundDrain {
     }
     this.sessions.clear();
     this.requests.clear();
+    this.steerRequests.clear();
     this.permissions.clear();
   }
 }

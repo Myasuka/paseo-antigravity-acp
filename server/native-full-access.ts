@@ -274,11 +274,12 @@ export function withNativeFullAccess(
           return;
         }
       }
-      if (input.type === 'session.prompt' && session) session.active = true;
+      const isForegroundPrompt = input.type === 'session.prompt' && input.prompt.delivery !== 'steer';
+      if (isForegroundPrompt && session) session.active = true;
       try {
         await inner.send(input);
       } catch (error) {
-        if (input.type === 'session.prompt' && session) session.active = false;
+        if (isForegroundPrompt && session) session.active = false;
         throw error;
       }
     },

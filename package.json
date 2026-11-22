@@ -1,6 +1,6 @@
 {
   "name": "paseo-antigravity-acp",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "Google Antigravity (agy acp) provider plugin for Paseo with interactive approvals, per-model thinking, background & Swarm continuation, and a live Swarm visualizer.",
   "license": "Apache-2.0",
   "type": "module",
@@ -41,7 +41,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "check:sanitize": "node scripts/check-sanitization.mjs",
-    "test": "node scripts/check-sanitization.mjs && node tests/resolve-agy.mjs && node tests/access-policy.mjs && node --experimental-strip-types tests/failed-tool-history.mjs && node tests/session-metadata.mjs && node --experimental-strip-types tests/tool-presentation.mjs && node --experimental-strip-types tests/history-timestamps.mjs && node tests/swarm-continuation.mjs && node tests/background-drain.mjs && node --experimental-strip-types tests/load-replay-barrier.mjs && node --experimental-strip-types tests/native-full-access.mjs && node --experimental-strip-types tests/model-thinking.mjs && node --experimental-strip-types tests/swarm-snapshot.mjs && node tests/client-contributions.mjs"
+    "test": "node scripts/check-sanitization.mjs && node tests/resolve-agy.mjs && node tests/access-policy.mjs && node --experimental-strip-types tests/failed-tool-history.mjs && node tests/session-metadata.mjs && node --experimental-strip-types tests/tool-presentation.mjs && node --experimental-strip-types tests/history-timestamps.mjs && node tests/swarm-continuation.mjs && node tests/background-drain.mjs && node --experimental-strip-types tests/load-replay-barrier.mjs && node --experimental-strip-types tests/native-full-access.mjs && node --experimental-strip-types tests/model-thinking.mjs && node --experimental-strip-types tests/swarm-steer.mjs && node --experimental-strip-types tests/swarm-snapshot.mjs && node tests/client-contributions.mjs"
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",

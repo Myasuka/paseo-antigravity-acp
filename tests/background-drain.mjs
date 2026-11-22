@@ -1674,4 +1674,353 @@ await scenario(async ({ root, bridge, emitted, append, begin }) => {
   );
 });
 
+// Swarm Case 12: Live swarm_progress card lifecycle, throttling, structural updates, and clean settlement,
+// while non-Swarm background commands emit zero swarm_progress cards.
+await scenario(async ({ bridge, emitted, append, begin, foreground }) => {
+  await begin();
+  await foreground();
+  const done = bridge.fromAgent(response);
+  await append([finished(), message(5, 'NO_SWARM_DONE')]);
+  assert.equal((await done).result.stopReason, 'end_turn');
+  assert.equal(
+    emitted.filter(e => e.params?.update?.name === 'swarm_progress').length,
+    0,
+    'Plain background run_command without Swarm must not emit swarm_progress',
+  );
+});
+
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.pollMs = 10;
+  bridge.settleMs = 15;
+  bridge.swarmProgressThrottleMs = 60;
+  bridge.timeoutMs = 3000;
+
+  const waitingConv = 'ffffffff-aaaa-bbbb-cccc-111111111111';
+  await setupSwarm(root, {
+    members: {
+      impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, killed: false },
+      reviewer: { conversation_id: waitingConv, role: 'worker', phase: 'WAITING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+    },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl implement parser', time: new Date().toISOString() }],
+  });
+  const implRows = [
+    { step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'start' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"go test ./..."' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${workerConv}/task-1` },
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Testing.' },
+  ];
+  await writeMemberTranscript(root, workerConv, implRows);
+  await writeMemberTranscript(root, waitingConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'standby' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Standing by.' },
+  ]);
+  const taskDir = join(root, 'brain', workerConv, '.system_generated/tasks');
+  await mkdir(taskDir, { recursive: true });
+  const taskLog = join(taskDir, 'task-1.log');
+  await writeFile(taskLog, 'start\n');
+
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'run swarm' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: '1' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Waiting' },
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-card-wait', name: 'swarm_wait', status: 'completed', rawInput: { since: 1 } } },
+  });
+
+  const done = bridge.fromAgent(response);
+  await delay(25);
+  const progressCalls = () =>
+    emitted.filter(
+      e => e.params?.update?.toolCallId?.includes(':swarm-progress:') && e.params.update.sessionUpdate === 'tool_call',
+    );
+  assert.equal(progressCalls().length, 1, 'Expected one swarm_progress tool_call');
+  const progressId = progressCalls()[0].params.update.toolCallId;
+  assert.equal(progressCalls()[0].params.update.status, 'in_progress');
+  assert.match(progressCalls()[0].params.update.rawInput.label, /1 active · 1 waiting · #1/);
+
+  // Immediate large byte append before throttleMs must wait until throttle window elapses
+  await appendFile(taskLog, 'a'.repeat(2048));
+  await delay(15);
+  const updatesBeforeThrottle = emitted.filter(
+    e => e.params?.update?.toolCallId === progressId && e.params.update.sessionUpdate === 'tool_call_update',
+  );
+  assert.equal(updatesBeforeThrottle.length, 0, 'Byte-only update within throttle window should be throttled');
+
+  await delay(65);
+  const updatesAfterThrottle = emitted.filter(
+    e => e.params?.update?.toolCallId === progressId && e.params.update.sessionUpdate === 'tool_call_update',
+  );
+  assert.ok(updatesAfterThrottle.length >= 1, 'Byte growth emits update after throttle window');
+  assert.match(updatesAfterThrottle.at(-1).params.update.rawInput.label, /2KB/);
+
+  // Structural board update emits immediately
+  await appendFile(
+    join(root, 'brain', id, '.system_generated/swarm/board.jsonl'),
+    JSON.stringify({ seq: 2, agent: 'impl', channel: 'main', text: '@coordinator [done] All tests passed', time: new Date().toISOString() }) + '\n',
+  );
+  implRows.push(
+    { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `<SYSTEM_MESSAGE>\ncontent=Task id "${workerConv}/task-1" finished with result:\nOK\n</SYSTEM_MESSAGE>` },
+    { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Finished.' },
+  );
+  await writeMemberTranscript(root, workerConv, implRows);
+  await append([
+    { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>Board wakeup #2</SYSTEM_MESSAGE>' },
+    message(4, 'SWARM_DONE'),
+  ]);
+
+  const res = await done;
+  assert.equal(res.result.stopReason, 'end_turn');
+  const cardEvents = emitted.filter(e => e.params?.update?.toolCallId === progressId).map(e => e.params.update);
+  assert.equal(cardEvents.at(-1).status, 'completed');
+  assert.match(cardEvents.at(-1).rawInput.label, /^Settled · .*#2/);
+});
+
+// Swarm Case 13: Error during Swarm drain finalizes swarm_progress card with status: 'failed'.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  bridge.nativeFull = true;
+  bridge.pollMs = 10;
+  bridge.timeoutMs = 2000;
+  await setupSwarm(root, {
+    members: { impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, killed: false } },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl go', time: new Date().toISOString() }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'go' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/x"' } }] },
+  ]);
+  await begin();
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'go' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm', args: { action: '"add"', name: '"impl"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Spawned' },
+    message(3, 'STARTED'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-fail-add', name: 'swarm', status: 'completed', rawInput: { action: 'add', name: 'impl' } } },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STARTED' } } },
+  });
+  const done = bridge.fromAgent(response);
+  await delay(25);
+  await append([{ step_index: 4, type: 'ERROR_MESSAGE', status: 'ERROR', error: 'Rate limit exhausted' }]);
+  const errRes = await done;
+  assert.match(errRes.error.message, /Rate limit exhausted/);
+  const failedCard = emitted.findLast(e => e.params?.update?.toolCallId?.includes(':swarm-progress:'));
+  assert.equal(failedCard?.params?.update?.status, 'failed');
+  assert.match(failedCard?.params?.update?.rawInput?.label ?? '', /^Failed · /);
+});
+
+// Swarm Case 14: BackgroundDrain.canSteer & steer() send guidance without session/cancel, avoid duplicate replay & foreignInput false-cancel,
+// re-open swarm_progress after paused guidance, accumulate usage, and keep stop button cancellation working.
+await scenario(async ({ root, bridge, emitted, append, begin }) => {
+  const upstream = [];
+  bridge.writeUpstream = msg => upstream.push(msg);
+  bridge.nativeFull = false;
+  bridge.pollMs = 10;
+  bridge.settleMs = 15;
+  bridge.timeoutMs = 3000;
+
+  await setupSwarm(root, {
+    members: { impl: { conversation_id: workerConv, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false } },
+    posts: [{ seq: 1, agent: 'coordinator', channel: 'main', text: '@impl build', time: new Date().toISOString() }],
+  });
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'build' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/a"' } }] },
+  ]);
+
+  await begin();
+  assert.equal(bridge.canSteer(id), false, 'Cannot steer before P1 finishes foreground');
+  await append([
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'start swarm' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm', args: { action: '"add"', name: '"impl"' } }] },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Spawned' },
+    message(3, 'SWARM_STARTED'),
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-steer-add', name: 'swarm', status: 'completed', rawInput: { action: 'add', name: 'impl' } } },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'SWARM_STARTED' } } },
+  });
+
+  let settled = false;
+  const done = bridge.fromAgent(response).then(r => {
+    settled = true;
+    return r;
+  });
+  await delay(30);
+  assert.equal(settled, false);
+  assert.equal(bridge.canSteer(id), true, 'Must allow steer while draining Swarm');
+
+  // Pending permission blocks steer until resolved
+  await bridge.fromAgent({ id: 'perm-1', method: 'session/request_permission', params: { sessionId: id } });
+  assert.equal(bridge.canSteer(id), false, 'Pending permission must block steer');
+  bridge.permissionResolved('perm-1');
+  assert.equal(bridge.canSteer(id), true);
+
+  // Send mid-Swarm guidance
+  const steerAccepted = await bridge.steer(id, [{ type: 'text', text: 'Focus on edge tests first' }]);
+  assert.equal(steerAccepted, true);
+  assert.equal(bridge.canSteer(id), false, 'Cannot start second concurrent steer while one is in flight');
+  assert.equal(upstream.length, 1);
+  assert.equal(upstream[0].id, 'agy-steer:1');
+  assert.equal(upstream[0].method, 'session/prompt');
+  assert.ok(!upstream.some(m => m.method === 'session/cancel'), 'Steer must never emit session/cancel');
+  assert.ok(
+    emitted.some(e => e.params?.update?.sessionUpdate === 'user_message_chunk' && e.params.update.content?.text === ''),
+    'Expected fallback chunk reset on steer',
+  );
+  const pausedCard = emitted.findLast(
+    e => e.params?.update?.toolCallId?.includes(':swarm-progress:') && e.params.update.toolCallId.endsWith(':1'),
+  );
+  assert.equal(pausedCard?.params?.update?.status, 'completed');
+  assert.match(pausedCard?.params?.update?.rawInput?.label ?? '', /^Guidance sent · /);
+
+  // Simulate agy acp streaming steered tool + reply and writing transcript
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'steer-tool-1', name: 'swarm', status: 'in_progress', rawInput: { action: 'status' } } },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call_update', toolCallId: 'steer-tool-1', status: 'completed', rawOutput: { output: 'impl active' } } },
+  });
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACK_GUIDANCE' } } },
+  });
+  await append([
+    { step_index: 4, type: 'USER_INPUT', status: 'DONE', content: 'Focus on edge tests first' },
+    {
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'swarm', args: { action: '"status"' } }],
+      input_tokens: 20,
+      cache_read_tokens: 5,
+      output_tokens: 4,
+    },
+    { step_index: 6, type: 'GENERIC', status: 'DONE', content: 'impl active' },
+    { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'ACK_GUIDANCE', input_tokens: 10, cache_read_tokens: 2, output_tokens: 3 },
+  ]);
+
+  const steerResOut = await bridge.fromAgent({ jsonrpc: '2.0', id: 'agy-steer:1', result: { stopReason: 'end_turn' } });
+  assert.equal(steerResOut, null, 'Internal agy-steer response must never forward downstream');
+  await delay(30);
+  assert.equal(settled, false, 'Outer turn must stay held while worker is still running');
+  assert.equal(bridge.canSteer(id), true, 'canSteer re-enabled after steer completes');
+  assert.equal(
+    emitted.filter(e => e.params?.update?.content?.text === 'ACK_GUIDANCE').length,
+    0,
+    'Live-streamed steer reply must NOT be duplicated by BackgroundProjection',
+  );
+  const resumedProgressCalls = emitted.filter(
+    e =>
+      e.params?.update?.toolCallId?.includes(':swarm-progress:') &&
+      e.params.update.toolCallId.endsWith(':2') &&
+      e.params.update.sessionUpdate === 'tool_call',
+  );
+  assert.equal(resumedProgressCalls.length, 1, 'Expected a fresh swarm_progress card after steer reply');
+
+  // Worker completes andCoordinator emits final summary
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'build' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Worker done.' },
+  ]);
+  await appendFile(
+    join(root, 'brain', id, '.system_generated/swarm/board.jsonl'),
+    JSON.stringify({ seq: 2, agent: 'impl', channel: 'main', text: '@coordinator [done] Verified', time: new Date().toISOString() }) + '\n',
+  );
+  await append([
+    { step_index: 8, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>Board wakeup #2</SYSTEM_MESSAGE>' },
+    { step_index: 9, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'ALL_DONE_AFTER_STEER', input_tokens: 15, cache_read_tokens: 3, output_tokens: 6 },
+  ]);
+
+  const finalRes = await done;
+  assert.equal(finalRes.result.stopReason, 'end_turn');
+  assert.deepEqual(finalRes.result.usage, {
+    inputTokens: 145,
+    outputTokens: 23,
+    cachedReadTokens: 40,
+    totalTokens: 208,
+  });
+  assert.ok(emitted.some(e => e.params?.update?.content?.text === 'ALL_DONE_AFTER_STEER'));
+
+  // Round 2: session/cancel with steerInFlight cancels cleanly and drops late steer response.
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'build' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/b"' } }] },
+  ]);
+  await bridge.fromClient({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'session/prompt',
+    params: { sessionId: id, prompt: [{ type: 'text', text: 'round 2' }] },
+  });
+  await append([
+    { step_index: 10, type: 'USER_INPUT', status: 'DONE', content: 'round 2' },
+    { step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: '2' } }] },
+    { step_index: 12, type: 'GENERIC', status: 'DONE', content: 'Waiting' },
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-r2', name: 'swarm_wait', status: 'completed', rawInput: { since: 2 } } },
+  });
+  const done2 = bridge.fromAgent({ ...response, id: 2 });
+  await delay(25);
+  assert.equal(await bridge.steer(id, [{ type: 'text', text: 'nudge 2' }]), true);
+  await bridge.fromClient({ method: 'session/cancel', params: { sessionId: id } });
+  assert.equal((await done2).result.stopReason, 'cancelled');
+  assert.equal(
+    await bridge.fromAgent({ jsonrpc: '2.0', id: 'agy-steer:2', result: { stopReason: 'cancelled' } }),
+    null,
+    'Late cancelled steer response after session/cancel must still be swallowed',
+  );
+
+  // Round 3: Genuinely foreign extra USER_INPUT beyond an accepted steer still triggers foreignInput cancellation.
+  await writeMemberTranscript(root, workerConv, [
+    { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: 'build' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date().toISOString(), tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/c"' } }] },
+  ]);
+  await bridge.fromClient({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'session/prompt',
+    params: { sessionId: id, prompt: [{ type: 'text', text: 'round 3' }] },
+  });
+  await append([
+    { step_index: 13, type: 'USER_INPUT', status: 'DONE', content: 'round 3' },
+    { step_index: 14, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: '2' } }] },
+    { step_index: 15, type: 'GENERIC', status: 'DONE', content: 'Waiting' },
+  ]);
+  await bridge.fromAgent({
+    method: 'session/update',
+    params: { sessionId: id, update: { sessionUpdate: 'tool_call', toolCallId: 'sw-r3', name: 'swarm_wait', status: 'completed', rawInput: { since: 2 } } },
+  });
+  const done3 = bridge.fromAgent({ ...response, id: 3 });
+  await delay(25);
+  assert.equal(await bridge.steer(id, [{ type: 'text', text: 'valid steer' }]), true);
+  await append([
+    { step_index: 16, type: 'USER_INPUT', status: 'DONE', content: 'valid steer' },
+    { step_index: 17, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Steer ack' },
+  ]);
+  await bridge.fromAgent({ jsonrpc: '2.0', id: 'agy-steer:3', result: { stopReason: 'end_turn' } });
+  await delay(25);
+  await append([
+    { step_index: 18, type: 'USER_INPUT', status: 'DONE', content: 'unexpected external client input' },
+    { step_index: 19, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Foreign reply' },
+  ]);
+  assert.equal((await done3).result.stopReason, 'cancelled', 'Foreign USER_INPUT beyond expected steers must still cancel');
+});
+
 console.log(JSON.stringify({ passed: true, cases, extraPromptsSent: 0 }));

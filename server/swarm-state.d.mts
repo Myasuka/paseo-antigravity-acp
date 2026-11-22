@@ -44,7 +44,40 @@ export interface MemberTranscriptSummary {
   hasPostInitialWakeup?: boolean;
   awaitingApproval: boolean;
   pendingBackgroundCount?: number;
+  backgroundTaskBytes?: number;
   backgroundProgressKey?: string;
+}
+
+export interface SwarmProgressWorker {
+  name: string;
+  status: 'active' | 'waiting' | 'stale';
+  activity: string | null;
+  steps: number;
+  lastActivityMs: number | null;
+  taskLogBytes: number;
+  awaitingApproval: boolean;
+  failure: string | null;
+}
+
+export interface SwarmProgressLatestPost {
+  seq: number;
+  agent: string;
+  channel: string;
+  preview: string;
+  time: string | null;
+}
+
+export interface SwarmProgressSummary {
+  title: string | null;
+  headSeq: number;
+  activeCount: number;
+  waitingCount: number;
+  staleCount: number;
+  hasPendingWakeup: boolean;
+  awaitingApproval: boolean;
+  lastActivityMs: number | null;
+  workers: SwarmProgressWorker[];
+  latestPost: SwarmProgressLatestPost | null;
 }
 
 export interface ObservedSwarmWorkerProgress {
@@ -73,6 +106,7 @@ export interface SwarmContinuationState {
   awaitingApproval?: boolean;
   workingWorkers?: SwarmWorkingWorkerState[];
   signature?: string | null;
+  progress?: SwarmProgressSummary | null;
 }
 
 export function isObserverMember(name: string, member?: RawSwarmMember | null): boolean;

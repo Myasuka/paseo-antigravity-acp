@@ -28,6 +28,13 @@ const fixtures = [
   { id: 'post-ch', name: 'post_message', kind: 'other', input: { channel: 'review', text: '@reviewer Ready for inspection' }, output: { output: 'Posted #8' } },
   { id: 'read-board', name: 'read_board', kind: 'other', input: { since: 4, channel: 'review' }, output: { output: '#5 @impl: progress' } },
   { id: 'swarm-wait', name: 'swarm_wait', kind: 'other', input: { since: 8, mentions_only: false }, output: { output: 'Woken by #9' } },
+  {
+    id: 'swarm-progress',
+    name: 'swarm_progress',
+    kind: 'other',
+    input: { label: '2 active · 1 waiting · #9' },
+    output: { label: '2 active · 1 waiting · #9', output: 'Swarm: Parser Refactor\nActive (2):\n- @core: go test [log 12KB]' },
+  },
 ];
 
 async function exercise(factory, extra = {}) {
@@ -181,6 +188,16 @@ assert.equal(enhanced.last('read-board').detail.label, 'read_board #review (sinc
 assert.equal(enhanced.last('read-board').detail.icon, 'eye');
 assert.equal(enhanced.last('swarm-wait').detail.label, 'swarm_wait (since #8) [any post]');
 assert.equal(enhanced.last('swarm-wait').detail.icon, 'sparkles');
+assert.deepEqual(enhanced.last('swarm-progress').detail, {
+  type: 'plain_text',
+  label: '2 active · 1 waiting · #9',
+  text: 'Swarm: Parser Refactor\nActive (2):\n- @core: go test [log 12KB]',
+  icon: 'bot',
+});
+assert.deepEqual(buildToolCallDisplayModel(enhanced.last('swarm-progress')), {
+  displayName: 'Swarm progress',
+  summary: '2 active · 1 waiting · #9',
+});
 assert.equal(enhanced.rows.filter(row => row.id === 'shell')[0].detail.command, 'printf HELLO');
 
 const explicit = {

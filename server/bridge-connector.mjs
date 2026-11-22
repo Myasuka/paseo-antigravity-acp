@@ -22,7 +22,7 @@ function killChildTree(child, signal) {
   } catch {}
 }
 
-export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots = [] } = {}) {
+export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots = [], onClose } = {}) {
   let baseRoots = defaultReadOnlyRoots;
   if (env.PASEO_AGY_READ_POLICY_FILE) {
     const rules = JSON.parse(readFileSync(env.PASEO_AGY_READ_POLICY_FILE, 'utf8'));
@@ -119,6 +119,7 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
 
   const background = new BackgroundDrain({
     emit: deliver,
+    writeUpstream: writeChild,
     dataDir: env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || undefined,
     timeoutMs: backgroundTimeout,
     nativeFull: env.PASEO_AGY_NATIVE_FULL_ACCESS === '1',
@@ -130,6 +131,9 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
     if (stopping) return;
     stopping = true;
     background.close();
+    try {
+      onClose?.();
+    } catch {}
     try {
       rl.close();
     } catch {}
@@ -148,10 +152,35 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
   let agentQueue = Promise.resolve();
   rl.on('line', line => {
     if (!line.trim()) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch (err) {
+      agentQueue = agentQueue.then(() => {
+        if (stopping || streamClosed) return;
+        errorDownstream(err instanceof Error ? err : new Error('Invalid agent ACP JSON'));
+        stop();
+      });
+      return;
+    }
+    if (background.isDeferredPromptResponse(parsed)) {
+      // Wait for prior ordered notifications, then run long background/Swarm drain off agentQueue
+      // so steer updates, steer responses, and interactive permissions never deadlock.
+      void agentQueue.then(async () => {
+        if (stopping || streamClosed) return;
+        try {
+          deliver(await background.fromAgent(parsed));
+        } catch (err) {
+          errorDownstream(err instanceof Error ? err : new Error('Invalid agent ACP JSON'));
+          stop();
+        }
+      });
+      return;
+    }
     agentQueue = agentQueue.then(async () => {
       if (stopping || streamClosed) return;
       try {
-        deliver(await background.fromAgent(JSON.parse(line)));
+        deliver(await background.fromAgent(parsed));
       } catch (err) {
         errorDownstream(err instanceof Error ? err : new Error('Invalid agent ACP JSON'));
         stop();
@@ -208,5 +237,10 @@ export function createAgyBridgeStream({ env = process.env, defaultReadOnlyRoots 
     },
   });
 
-  return { readable, writable };
+  return {
+    readable,
+    writable,
+    canSteer: sessionId => background.canSteer(sessionId),
+    steer: (sessionId, prompt) => background.steer(sessionId, prompt),
+  };
 }

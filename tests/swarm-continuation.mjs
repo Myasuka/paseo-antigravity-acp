@@ -762,5 +762,102 @@ const nowMs = Date.parse('2026-06-01T12:00:00.000Z');
   }
 }
 
+// 13. inspectSwarmContinuation populates structured progress summary (active/stale/waiting workers, taskLogBytes, latest non-control post).
+{
+  const root = await mkdtemp(join(tmpdir(), 'agy-swarm-cont-13-'));
+  const WAIT_CONV = 'cccccccc-1111-2222-3333-444444444444';
+  const STALE_CONV = 'dddddddd-1111-2222-3333-444444444444';
+  const NARR_CONV = 'eeeeeeee-1111-2222-3333-444444444444';
+  try {
+    const recentIso = new Date(nowMs - 8 * 1000).toISOString();
+    const staleIso = new Date(nowMs - 15 * 60 * 1000).toISOString();
+    await writeSwarm(root, {
+      members: {
+        'core-worker': { conversation_id: WORKER_CONV, role: 'worker', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, killed: false },
+        'stale-worker': { conversation_id: STALE_CONV, role: 'worker', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, killed: false },
+        'done-worker': { conversation_id: WAIT_CONV, role: 'worker', phase: 'WAITING', wake_mode: 'mentions', last_read_seq: 2, killed: false },
+        narrator: { conversation_id: NARR_CONV, role: 'narrator', wake_mode: 'any', last_read_seq: 2, killed: false },
+      },
+      posts: [
+        { seq: 1, agent: 'coordinator', channel: 'main', text: '@all start tasks', time: staleIso, control: false },
+        { seq: 2, agent: 'done-worker', channel: 'main', text: '@coordinator [done] Verified edge cases\nDetails follow', time: recentIso, control: false },
+        { seq: 3, agent: 'coordinator', channel: 'main', text: 'control ping', time: recentIso, control: true },
+      ],
+    });
+    await writeTranscript(root, WORKER_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'test' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: recentIso,
+        tool_calls: [{ name: 'run_command', args: { CommandLine: '"go test -race ./..."' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: recentIso,
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-10`,
+      },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, content: 'Running background test.' },
+    ]);
+    const taskDir = join(root, 'brain', WORKER_CONV, '.system_generated', 'tasks');
+    await mkdir(taskDir, { recursive: true });
+    const logPath = join(taskDir, 'task-10.log');
+    await writeFile(logPath, 'x'.repeat(2048));
+    await utimes(logPath, new Date(nowMs - 2000), new Date(nowMs - 2000));
+
+    await writeTranscript(
+      root,
+      STALE_CONV,
+      [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: staleIso, content: 'old work' },
+        { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: staleIso, tool_calls: [{ name: 'read_file', args: { Path: '"/tmp/x"' } }] },
+      ],
+      nowMs - 15 * 60 * 1000,
+    );
+    await writeTranscript(root, WAIT_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: staleIso, content: 'verify' },
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, content: 'Done.' },
+    ]);
+    await writeTranscript(root, NARR_CONV, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: recentIso, content: 'narrate' },
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, tool_calls: [{ name: 'write_file', args: { Path: '"/tmp/v.json"' } }] },
+    ]);
+
+    const state = await inspectSwarmContinuation({ dataDir: root, sessionId: COORD_CONV, nowMs });
+    assert.equal(state.exists, true);
+    assert.equal(state.active, true);
+    assert.ok(state.progress);
+    assert.equal(state.progress.title, 'Test Swarm');
+    assert.equal(state.progress.headSeq, 3);
+    assert.equal(state.progress.activeCount, 1);
+    assert.equal(state.progress.staleCount, 1);
+    assert.equal(state.progress.waitingCount, 1);
+    assert.deepEqual(
+      state.progress.workers.map(w => [w.name, w.status]),
+      [
+        ['core-worker', 'active'],
+        ['stale-worker', 'stale'],
+        ['done-worker', 'waiting'],
+      ],
+    );
+    assert.equal(state.progress.workers[0].taskLogBytes, 2048);
+    assert.match(state.progress.workers[0].activity ?? '', /task-10/);
+    assert.equal(state.progress.workers[2].activity, null);
+    assert.deepEqual(state.progress.latestPost, {
+      seq: 2,
+      agent: 'done-worker',
+      channel: 'main',
+      preview: '@coordinator [done] Verified edge cases',
+      time: recentIso,
+    });
+    cases.push('swarm-progress-summary');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 assert.equal(DEFAULT_SWARM_WORKER_STALE_MS, 10 * 60 * 1000);
 console.log(JSON.stringify({ passed: true, suite: 'swarm-continuation', cases }));

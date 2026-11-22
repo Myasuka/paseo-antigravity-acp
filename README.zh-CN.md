@@ -29,9 +29,11 @@
 - 将 `run_command`、`read_file`、`edit_file`、`write_file`、`grep_search`、`find_by_name`、`search_web`、`read_url_content`、`invoke_subagent`、`manage_subagents`、`send_message` 以及 Swarm 工具（`swarm`、`post_message`、`read_board`、`swarm_wait`）映射为结构化 Paseo 工具详情卡片，并修正命令失败时的工具错误状态展示。
 - 在关闭后重开会话（`session/load`）重放历史消息时，自动从本地 Antigravity transcript 读取真实消息与工具完成时间戳注入 `timeline.item.timestamp`；并在桥接层等待 `agy acp` 异步历史回放完全排空后再放行 `session/load` 响应，彻底避免重开长会话时发生消息重复输出及轮次完成时间被改写成当前时间的问题。
 
-### 4. 后台任务与原生 `/swarm` 自动排空接续
+### 4. 后台任务与原生 `/swarm` 自动排空接续、主线实时进度卡与非破坏性中途引导
 - 解决 `agy acp` 在后台异步 `run_command`、`invoke_subagent` 或 `/swarm` Worker 尚未结束时提前返回 `end_turn` 导致消息断流的问题。
 - 实时追踪 `.system_generated/logs/transcript.jsonl` 与 `.system_generated/swarm/{members.json,board.jsonl}`，同时感知各个 Worker 尚未结束的后台 `run_command` 任务（含 `.system_generated/tasks/task-*.log` 实时日志进展）与 `invoke_subagent` 子 Agent：只要仍有非观察类任务型 Worker 处于运行态或存在未消费的留言板唤醒，自动保持 Paseo 回合在线、修正 Swarm 看板状态并流式补发后续工具状态、回复正文与增量 Token 统计。
+- 在主对话时间线中就地维护单张实时 **Swarm progress** 卡片（`swarm_progress`），展示工作/等待中成员数、各 Worker 当前动作与后台任务日志字节进展、真实最近活跃时间及最新留言板动态，并同步动态刷新输入框下方的 **Swarm** 胶囊文字（如 `Swarm · 2 工作中` / 告警数），无需点开侧边栏也能一眼确认运转状态。
+- 实现 `prompt.steer` 协议能力：在 Swarm 后台排空期于主输入框发送指导或追问消息时，直接无损送达 Coordinator 而不下发 `session/cancel`，彻底避免打断运行中的 Worker；点击 **Stop** 仍会显式下发 `session/cancel`，前台模型正在流式生成期间则平滑回退。
 - 自动忽略仅处于驻留监听态的观察角色（`narrator`、`monitor`），并自动识别长时间无进展的僵死或孤儿 Worker，防止残留 Swarm 状态劫持无关后续对话或在 `Full access` 模式下死锁 `end_turn`；在非 Full access 模式下若后台 Worker 因无法弹出审批而卡住，会在超时后给出清晰诊断提示。
 
 ### 5. Paseo 内置 Swarm 实时可视化看板

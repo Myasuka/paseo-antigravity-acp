@@ -372,6 +372,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -410,6 +411,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -454,11 +456,15 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
 
     const { pendingBgTasks, pendingSubagents } = trackPendingBackgroundWork(rows);
     const backgroundProgressParts = [];
+    let backgroundTaskBytes = 0;
     if (pendingBgTasks.size > 0 || pendingSubagents.size > 0) {
       const systemGenDir = dirname(dirname(transcriptPath));
       for (const taskInfo of pendingBgTasks.values()) {
         try {
           const taskStat = await stat(join(systemGenDir, 'tasks', `${taskInfo.taskName}.log`));
+          if (Number.isFinite(taskStat.size) && taskStat.size > 0) {
+            backgroundTaskBytes += taskStat.size;
+          }
           backgroundProgressParts.push(`t:${taskInfo.taskName}:${taskStat.size}:${Math.round(taskStat.mtimeMs)}`);
           if (
             Number.isFinite(taskStat.mtimeMs) &&
@@ -514,6 +520,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         hasPostInitialWakeup,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -534,6 +541,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         hasPostInitialWakeup,
         awaitingApproval: false,
         pendingBackgroundCount,
+        backgroundTaskBytes,
         backgroundProgressKey,
       };
     }
@@ -558,6 +566,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
           hasPostInitialWakeup,
           awaitingApproval: false,
           pendingBackgroundCount,
+          backgroundTaskBytes,
           backgroundProgressKey,
         };
       }
@@ -575,6 +584,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         hasPostInitialWakeup,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -601,6 +611,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         hasPostInitialWakeup,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -626,6 +637,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
       hasPostInitialWakeup,
       awaitingApproval,
       pendingBackgroundCount,
+      backgroundTaskBytes,
       backgroundProgressKey,
     };
   } catch (error) {
@@ -643,6 +655,7 @@ export async function summarizeMemberTranscript(transcriptPath, nowMs = Date.now
         lastTurnBoundaryMs: null,
         awaitingApproval: false,
         pendingBackgroundCount: 0,
+        backgroundTaskBytes: 0,
         backgroundProgressKey: '',
       };
     }
@@ -772,6 +785,7 @@ export async function inspectSwarmContinuation({
     awaitingApproval: false,
     workingWorkers: [],
     signature: null,
+    progress: null,
   };
   if (!UUID_RE.test(sessionId ?? '')) {
     return emptyState;
@@ -819,8 +833,19 @@ export async function inspectSwarmContinuation({
   const staleWorkerKeys = [];
   const workingWorkers = [];
   const workerSignatureParts = [];
+  const progressWorkers = [];
+  let activeCount = 0;
+  let waitingCount = 0;
+  let staleCount = 0;
+  let lastProgressActivityMs = null;
   let hasPendingWakeup = false;
   let awaitingApproval = false;
+
+  const bumpActivity = ms => {
+    if (Number.isFinite(ms) && ms > 0 && (lastProgressActivityMs === null || ms > lastProgressActivityMs)) {
+      lastProgressActivityMs = ms;
+    }
+  };
 
   for (const [name, member] of entries) {
     if (member.killed) continue;
@@ -856,6 +881,7 @@ export async function inspectSwarmContinuation({
           lastTurnBoundaryMs: null,
           awaitingApproval: false,
           pendingBackgroundCount: 0,
+          backgroundTaskBytes: 0,
           backgroundProgressKey: '',
         };
 
@@ -874,6 +900,18 @@ export async function inspectSwarmContinuation({
     if (status !== 'working') {
       if (observedWorkers instanceof Map) observedWorkers.delete(workerKey);
       if (pendingForMember) hasPendingWakeup = true;
+      waitingCount++;
+      bumpActivity(transcriptSummary.lastProgressMs);
+      progressWorkers.push({
+        name,
+        status: 'waiting',
+        activity: null,
+        steps: transcriptSummary.steps,
+        lastActivityMs: transcriptSummary.lastProgressMs,
+        taskLogBytes: 0,
+        awaitingApproval: false,
+        failure: transcriptSummary.failure?.message ?? null,
+      });
       continue;
     }
 
@@ -918,22 +956,38 @@ export async function inspectSwarmContinuation({
       Number.isFinite(effectiveLastActivityMs) &&
       nowMs - effectiveLastActivityMs >= workerStaleMs;
 
+    const workerLastMs = Number.isFinite(effectiveLastActivityMs) ? effectiveLastActivityMs : null;
+    bumpActivity(workerLastMs);
+
     workingWorkers.push({
       name,
       conversationId: UUID_RE.test(convId) ? convId : null,
       key: workerKey,
       progressKey,
-      lastActivityMs: Number.isFinite(effectiveLastActivityMs) ? effectiveLastActivityMs : null,
+      lastActivityMs: workerLastMs,
       awaitingApproval: Boolean(transcriptSummary.awaitingApproval),
       pendingWakeup: pendingForMember,
       stale: isStale,
     });
 
+    progressWorkers.push({
+      name,
+      status: isStale ? 'stale' : 'active',
+      activity: transcriptSummary.activity ?? null,
+      steps: transcriptSummary.steps,
+      lastActivityMs: workerLastMs,
+      taskLogBytes: transcriptSummary.backgroundTaskBytes ?? 0,
+      awaitingApproval: Boolean(transcriptSummary.awaitingApproval),
+      failure: transcriptSummary.failure?.message ?? null,
+    });
+
     if (isStale) {
       staleWorkerKeys.push(workerKey);
+      staleCount++;
     } else {
       if (transcriptSummary.awaitingApproval) awaitingApproval = true;
       activeWorkerConversations.push(workerKey);
+      activeCount++;
     }
   }
 
@@ -956,6 +1010,24 @@ export async function inspectSwarmContinuation({
   }
 
   const boardHeadSeq = board.messages.at(-1)?.seq ?? 0;
+  const rawLatestPost = [...board.messages].reverse().find(post => !post.control) ?? board.messages.at(-1) ?? null;
+  let latestPost = null;
+  if (rawLatestPost) {
+    const previewLine = rawLatestPost.text.split(/\r?\n/).find(line => line.trim())?.trim() ?? '';
+    latestPost = {
+      seq: rawLatestPost.seq,
+      agent: rawLatestPost.agent,
+      channel: rawLatestPost.channel || 'main',
+      preview: previewLine.slice(0, 120),
+      time: rawLatestPost.time,
+    };
+    bumpActivity(getPostRefMs(rawLatestPost));
+  }
+
+  const statusRank = { active: 0, stale: 1, waiting: 2 };
+  progressWorkers.sort((a, b) => statusRank[a.status] - statusRank[b.status] || a.name.localeCompare(b.name));
+  const title = typeof membersDoc.title === 'string' && membersDoc.title.trim() ? membersDoc.title.trim() : null;
+
   const signature = [
     `m:${Math.round(membersFile.mtimeMs)}:${membersFile.size}`,
     `b:${boardHeadSeq}:${Math.round(board.mtimeMs)}:${board.size}`,
@@ -972,5 +1044,17 @@ export async function inspectSwarmContinuation({
     awaitingApproval,
     workingWorkers,
     signature,
+    progress: {
+      title,
+      headSeq: boardHeadSeq,
+      activeCount,
+      waitingCount,
+      staleCount,
+      hasPendingWakeup,
+      awaitingApproval,
+      lastActivityMs: lastProgressActivityMs,
+      workers: progressWorkers,
+      latestPost,
+    },
   };
 }

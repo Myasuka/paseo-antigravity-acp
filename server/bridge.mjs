@@ -44,7 +44,11 @@ const child = spawn(resolved.path, args, {
   detached: true,
 });
 
-const background = new BackgroundDrain({ emit: deliver, timeoutMs: backgroundTimeout });
+const background = new BackgroundDrain({
+  emit: deliver,
+  writeUpstream: msg => write(child.stdin, msg),
+  timeoutMs: backgroundTimeout,
+});
 let stopping = false;
 let timer;
 
@@ -107,10 +111,33 @@ async function clientLine(line) {
 let agentQueue = Promise.resolve();
 function agentLine(line) {
   if (!line.trim()) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    agentQueue = agentQueue.then(() => {
+      if (stopping) return;
+      process.stderr.write('Invalid agent ACP JSON.\n');
+      stop();
+    });
+    return;
+  }
+  if (background.isDeferredPromptResponse(parsed)) {
+    void agentQueue.then(async () => {
+      if (stopping) return;
+      try {
+        deliver(await background.fromAgent(parsed));
+      } catch {
+        process.stderr.write('Invalid agent ACP JSON.\n');
+        stop();
+      }
+    });
+    return;
+  }
   agentQueue = agentQueue.then(async () => {
     if (stopping) return;
     try {
-      deliver(await background.fromAgent(JSON.parse(line)));
+      deliver(await background.fromAgent(parsed));
     } catch {
       process.stderr.write('Invalid agent ACP JSON.\n');
       stop();

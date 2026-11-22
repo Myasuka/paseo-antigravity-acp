@@ -215,7 +215,11 @@ export function useSettings() {
 
   // Override useEffect/useRef minimally via React dispatcher wrapper for synchronous tree rendering
   const { default: contributeClient } = await import(pathToFileURL(join(tmpRoot, 'index.client.mjs')).href);
-  const { SwarmBoardPanel, SwarmStatusPillIcon } = await import(pathToFileURL(join(tmpRoot, 'client/swarm-panel.mjs')).href);
+  const {
+    SwarmBoardPanel,
+    SwarmStatusPillIcon,
+    publishSwarmPillSummary,
+  } = await import(pathToFileURL(join(tmpRoot, 'client/swarm-panel.mjs')).href);
 
   // 1. Verify contributeClient registrations & dynamic composer pill lifecycle
   const settingsScreens = [];
@@ -271,9 +275,13 @@ export function useSettings() {
     },
     addComposerPill(pill) {
       const key = `${pill.workspaceId}:${pill.agentId}:${pill.id}`;
-      activePills.set(key, pill);
+      const record = { ...pill, button: { ...pill.button }, updateCalls: 0 };
+      activePills.set(key, record);
       return {
-        update() {},
+        update(patch) {
+          record.button = { ...record.button, ...patch };
+          record.updateCalls++;
+        },
         remove() {
           activePills.delete(key);
         },
@@ -318,18 +326,38 @@ export function useSettings() {
   assert.ok(activePills.has('wks-1:ag-native-1:swarm-board'));
 
   // Clicking the pill opens the swarm panel scoped to workspace + agent
-  activePills.get('wks-1:ag-acp-1:swarm-board').button.behavior.onPress();
+  const acpPill = activePills.get('wks-1:ag-acp-1:swarm-board');
+  acpPill.button.behavior.onPress();
   assert.deepEqual(openedPanels.at(-1), {
     panelId: 'swarm',
     target: { workspaceId: 'wks-1', agentId: 'ag-acp-1' },
   });
 
-  // Archiving an agent dynamically removes its pill
+  // Dynamic pill label updates from SwarmStatusPillIcon summary notifications
+  assert.equal(acpPill.button.label.__i18nKey, 'swarmPillLabel');
+  publishSwarmPillSummary('ag-acp-1', { state: 'live', active: 2, waiting: 1, alerts: 0 });
+  assert.equal(acpPill.button.label.__i18nKey, 'swarmPillActiveLabel');
+  assert.deepEqual(acpPill.button.label.values, { active: 2 });
+
+  publishSwarmPillSummary('ag-acp-1', { state: 'alert', active: 1, waiting: 0, alerts: 3 });
+  assert.equal(acpPill.button.label.__i18nKey, 'swarmPillActiveAlertLabel');
+  assert.deepEqual(acpPill.button.label.values, { active: 1, alerts: 3 });
+
+  publishSwarmPillSummary('ag-acp-1', { state: 'live', active: 0, waiting: 1, alerts: 0 });
+  assert.equal(acpPill.button.label.__i18nKey, 'swarmPillLiveLabel');
+
+  publishSwarmPillSummary('ag-acp-1', { state: 'idle', active: 0, waiting: 1, alerts: 0 });
+  assert.equal(acpPill.button.label.__i18nKey, 'swarmPillLabel');
+
+  // Archiving an agent dynamically removes its pill and unsubscribes label listener
+  const updatesBeforeArchive = acpPill.updateCalls;
   agentSubscriber({
     kind: 'upsert',
     agent: { id: 'ag-acp-1', provider: 'antigravity-acp', workspaceId: 'wks-1', archivedAt: '2026-06-01T00:00:00Z' },
   });
   assert.equal(activePills.size, 1);
+  publishSwarmPillSummary('ag-acp-1', { state: 'live', active: 4, waiting: 0, alerts: 0 });
+  assert.equal(acpPill.updateCalls, updatesBeforeArchive, 'Archived pill must stop receiving label updates');
 
   dispose();
   assert.equal(activePills.size, 0, 'Disposing client plugin must remove all pills');

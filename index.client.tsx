@@ -5,7 +5,12 @@ import type {
 } from "@getpaseo/plugin/client";
 import { messages } from "./client/messages";
 import { AntigravitySettingsScreen } from "./client/settings-screen";
-import { SwarmBoardPanel, SwarmStatusPillIcon } from "./client/swarm-panel";
+import {
+  SwarmBoardPanel,
+  SwarmStatusPillIcon,
+  formatSwarmPillLabel,
+  subscribeSwarmPillSummary,
+} from "./client/swarm-panel";
 
 function isAntigravityProvider(provider?: string | null): boolean {
   return provider === "antigravity-acp" || provider === "antigravity";
@@ -59,7 +64,10 @@ export default function contribute(client: PluginClientContext) {
     },
   });
 
-  const pills = new Map<string, { workspaceId: string; reg: PluginButtonRegistration<PluginText> }>();
+  const pills = new Map<
+    string,
+    { workspaceId: string; reg: PluginButtonRegistration<PluginText>; unsubSummary: () => void }
+  >();
   let disposed = false;
   let unsubOwned: (() => void) | undefined;
   let releaseListSub: (() => Promise<void>) | undefined;
@@ -67,6 +75,7 @@ export default function contribute(client: PluginClientContext) {
   const removePill = (agentId: string) => {
     const existing = pills.get(agentId);
     if (existing) {
+      existing.unsubSummary();
       existing.reg.remove();
       pills.delete(agentId);
     }
@@ -86,6 +95,7 @@ export default function contribute(client: PluginClientContext) {
     const workspaceId = agent.workspaceId;
     const existing = pills.get(agent.id);
     if (existing && existing.workspaceId === workspaceId) return;
+    existing?.unsubSummary();
     existing?.reg.remove();
 
     const reg = client.addComposerPill({
@@ -104,7 +114,10 @@ export default function contribute(client: PluginClientContext) {
         },
       },
     });
-    pills.set(agent.id, { workspaceId, reg });
+    const unsubSummary = subscribeSwarmPillSummary(agent.id, (summary) => {
+      reg.update({ label: formatSwarmPillLabel(summary) });
+    });
+    pills.set(agent.id, { workspaceId, reg, unsubSummary });
   };
 
   const unsubAgentUpdates = client.paseo.agents.subscribe((update) => {
@@ -144,7 +157,10 @@ export default function contribute(client: PluginClientContext) {
     unsubOwned?.();
     void releaseListSub?.();
     unsubAgentUpdates();
-    for (const { reg } of pills.values()) reg.remove();
+    for (const { reg, unsubSummary } of pills.values()) {
+      unsubSummary();
+      reg.remove();
+    }
     pills.clear();
     removeSlashCommand();
     removeSwarmCommand();

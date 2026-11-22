@@ -8,6 +8,7 @@ import {
   useTranslation,
   type PluginAgentPanelProps,
   type PluginButtonIconProps,
+  type PluginText,
 } from "@getpaseo/plugin/client";
 import { copyText, Icon, Loading, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import {
@@ -89,39 +90,106 @@ function StatusDot({ status, theme, size = 8 }: { status: SwarmMember["status"];
   );
 }
 
+export type SwarmPillSummary = {
+  state: "none" | "idle" | "live" | "alert";
+  active: number;
+  waiting: number;
+  alerts: number;
+};
+
+type SwarmPillListener = (summary: SwarmPillSummary) => void;
+const pillSummaryListeners = new Map<string, Set<SwarmPillListener>>();
+
+export function subscribeSwarmPillSummary(agentId: string, listener: SwarmPillListener): () => void {
+  let listeners = pillSummaryListeners.get(agentId);
+  if (!listeners) {
+    listeners = new Set();
+    pillSummaryListeners.set(agentId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    const current = pillSummaryListeners.get(agentId);
+    if (!current) return;
+    current.delete(listener);
+    if (current.size === 0) pillSummaryListeners.delete(agentId);
+  };
+}
+
+export function publishSwarmPillSummary(agentId: string, summary: SwarmPillSummary) {
+  const listeners = pillSummaryListeners.get(agentId);
+  if (!listeners) return;
+  for (const listener of [...listeners]) {
+    listener(summary);
+  }
+}
+
+export function formatSwarmPillLabel(summary: SwarmPillSummary): PluginText {
+  if (summary.state === "alert") {
+    return summary.active > 0
+      ? messages.message("swarmPillActiveAlertLabel", { active: summary.active, alerts: summary.alerts })
+      : messages.message("swarmPillAlertLabel", { alerts: summary.alerts });
+  }
+  if (summary.state === "live") {
+    return summary.active > 0
+      ? messages.message("swarmPillActiveLabel", { active: summary.active })
+      : messages.message("swarmPillLiveLabel");
+  }
+  return messages.message("swarmPillLabel");
+}
+
 export function SwarmStatusPillIcon(props: PluginButtonIconProps) {
   const fetchSnapshot = useRpc(swarmSnapshotRpc);
   const agentId = props.context === "agent" ? props.agentId : "";
   const [indicator, setIndicator] = useState<"none" | "idle" | "live" | "alert">("none");
   const etagRef = useRef<string | undefined>(undefined);
+  const lastSummaryKeyRef = useRef<string>("");
 
   useEffect(() => {
     if (!agentId) return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    lastSummaryKeyRef.current = "";
+
     const poll = async () => {
+      let nextDelayMs = 4000;
       try {
         const res = await fetchSnapshot({ agentId, etag: etagRef.current });
         if (cancelled) return;
+        let nextSummary: SwarmPillSummary;
         if (res.status === "empty") {
           etagRef.current = undefined;
-          setIndicator("none");
+          nextSummary = { state: "none", active: 0, waiting: 0, alerts: 0 };
         } else {
           etagRef.current = res.etag;
-          if (res.counts.alerts > 0) setIndicator("alert");
-          else if (res.live) setIndicator("live");
-          else setIndicator("idle");
+          const nextState: SwarmPillSummary["state"] =
+            res.counts.alerts > 0 ? "alert" : res.live ? "live" : "idle";
+          nextSummary = {
+            state: nextState,
+            active: res.counts.active,
+            waiting: res.counts.waiting,
+            alerts: res.counts.alerts,
+          };
+          if (nextState === "live" || nextState === "alert") nextDelayMs = 2500;
+        }
+        setIndicator(nextSummary.state);
+        const key = `${nextSummary.state}:${nextSummary.active}:${nextSummary.waiting}:${nextSummary.alerts}`;
+        if (key !== lastSummaryKeyRef.current) {
+          lastSummaryKeyRef.current = key;
+          publishSwarmPillSummary(agentId, nextSummary);
         }
       } catch {
         // Keep last indicator when host is transiently reconnecting.
       }
+      if (!cancelled) {
+        timer = setTimeout(() => {
+          void poll();
+        }, nextDelayMs);
+      }
     };
     void poll();
-    const timer = setInterval(() => {
-      void poll();
-    }, 4000);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      if (timer) clearTimeout(timer);
     };
   }, [agentId, fetchSnapshot]);
 

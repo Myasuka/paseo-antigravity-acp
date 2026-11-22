@@ -8,12 +8,14 @@ import {
 } from '@getpaseo/plugin/server/acp';
 import type {
   ProviderConnection,
+  ProviderEvent,
   ProviderPersistence,
+  ProviderPrompt,
   ProviderRegistration,
   ProviderToolCallDetail,
 } from '@getpaseo/plugin/server/provider';
 import { DEFAULT_READ_ONLY_ROOTS } from '../shared/settings.ts';
-import { createAgyBridgeStream } from './bridge-connector.mjs';
+import { createAgyBridgeStream, type AgyBridgeStream } from './bridge-connector.mjs';
 import { loadHistoryTimestampMatcher, type HistoryTimestampMatcher } from './history-timestamps.mjs';
 import { withNativeFullAccess } from './native-full-access.ts';
 import { resolveAgyBinary } from './resolve-agy.mjs';
@@ -215,7 +217,41 @@ export function toolDetail(snapshot: AcpToolCallSnapshot): ProviderToolCallDetai
     const label = `swarm_wait${since !== undefined ? ` (since #${since})` : ''}${mentionsOnly === false ? ' [any post]' : ''}`;
     return { type: 'plain_text', label, text: result, icon: 'sparkles' };
   }
+  if (name === 'swarm_progress') {
+    const label = text(output, 'label') ?? text(input, 'label') ?? 'Swarm active';
+    return {
+      type: 'plain_text',
+      label,
+      text: result,
+      icon: 'bot',
+    };
+  }
   return undefined;
+}
+
+type SteerBridgeHandle = {
+  canSteer(sessionId: string): boolean;
+  steer(sessionId: string, prompt: readonly unknown[]): Promise<boolean>;
+};
+
+function isSteerBridge(stream: unknown): stream is SteerBridgeHandle {
+  return (
+    typeof stream === 'object' &&
+    stream !== null &&
+    typeof (stream as SteerBridgeHandle).canSteer === 'function' &&
+    typeof (stream as SteerBridgeHandle).steer === 'function'
+  );
+}
+
+function toAcpPromptBlocks(prompt: ProviderPrompt): Array<Record<string, unknown>> {
+  if (prompt.input.type === 'command') {
+    const suffix = prompt.input.arguments ? ` ${prompt.input.arguments}` : '';
+    return [{ type: 'text', text: `/${prompt.input.name}${suffix}` }];
+  }
+  return prompt.input.content.map(content => {
+    if (content.type === 'text' || content.type === 'image') return content;
+    return { type: 'text', text: JSON.stringify(content) };
+  });
 }
 
 /** Reuse Paseo's native detail cards while keeping AGY execution, settings, and permission handling intact. */
@@ -286,6 +322,19 @@ export function createDetailedAgyProvider(
       const openRequests = new Map<string, string>();
       const runtimeEnv = (await extra.resolveRuntimeEnv?.()) ?? {};
       const pendingSessionEnvs: Record<string, string>[] = [];
+      const activeBridges = new Set<SteerBridgeHandle>();
+      let connectorSupportsSteer = !hasExplicitTransport;
+
+      const wrappedConnector: AcpConnector | undefined = options.connector
+        ? async () => {
+            const stream = await options.connector!();
+            if (isSteerBridge(stream)) {
+              connectorSupportsSteer = true;
+              activeBridges.add(stream);
+            }
+            return stream;
+          }
+        : undefined;
 
       const mergedLaunch =
         hasExplicitTransport && request.launch
@@ -318,7 +367,7 @@ export function createDetailedAgyProvider(
         },
       ];
 
-      const connectOptions: RunAcpProviderOptions = options.connector
+      const connectOptions: RunAcpProviderOptions = wrappedConnector
         ? {
             id: options.id,
             label: options.label,
@@ -326,7 +375,7 @@ export function createDetailedAgyProvider(
             icon: options.icon,
             acpOptions: options.acpOptions,
             transformers: enrichedTransformers,
-            connector: options.connector,
+            connector: wrappedConnector,
           }
         : options.command
           ? {
@@ -354,10 +403,15 @@ export function createDetailedAgyProvider(
                     ...(request.launch?.env ?? {}),
                     PASEO_AGY_NATIVE_FULL_ACCESS: '0',
                   } as Record<string, string>);
-                return createAgyBridgeStream({
+                const handle: AgyBridgeStream = createAgyBridgeStream({
                   env: nextEnv,
                   defaultReadOnlyRoots: defaultRoots,
+                  onClose: () => {
+                    activeBridges.delete(handle);
+                  },
                 });
+                activeBridges.add(handle);
+                return handle;
               },
             };
 
@@ -366,28 +420,105 @@ export function createDetailedAgyProvider(
         ...(mergedLaunch ? { launch: mergedLaunch } : {}),
       });
 
-      const launchAwareInner: ProviderConnection = hasExplicitTransport
-        ? rawInner
-        : {
-            version: rawInner.version,
-            capabilities: rawInner.capabilities,
-            onEvent: listener => rawInner.onEvent(listener),
-            close: () => rawInner.close(),
-            async send(input) {
-              if (input.type === 'session.open') {
-                const freshEnv = (await extra.resolveRuntimeEnv?.()) ?? {};
-                pendingSessionEnvs.push({
-                  ...process.env,
-                  ...freshEnv,
-                  ...(request.launch?.env ?? {}),
-                  ...input.config.env,
-                } as Record<string, string>);
-              }
-              return rawInner.send(input);
-            },
-          };
+      const steerEnabled = connectorSupportsSteer && request.capabilities.includes('prompt.steer');
+      const connectionCapabilities =
+        steerEnabled && !rawInner.capabilities.includes('prompt.steer')
+          ? [...rawInner.capabilities, 'prompt.steer']
+          : rawInner.capabilities;
 
-      const connection = withNativeFullAccess(launchAwareInner, {
+      const bridgeListeners = new Set<(event: ProviderEvent) => void>();
+      const steerSessions = new Map<string, { nativeSessionId?: string; activeTurnId: string | null }>();
+      const emitBridgeEvent = (event: ProviderEvent) => {
+        for (const listener of bridgeListeners) listener(event);
+      };
+      const unsubscribeRaw = rawInner.onEvent(rawEvent => {
+        let event = rawEvent;
+        if (event.type === 'session.opened') {
+          steerSessions.set(event.sessionId, {
+            nativeSessionId: readNativeSessionId(event.persistence),
+            activeTurnId: null,
+          });
+          if (steerEnabled && !event.capabilities.includes('prompt.steer')) {
+            event = { ...event, capabilities: [...event.capabilities, 'prompt.steer'] };
+          }
+        } else if (event.type === 'session.persistence') {
+          const existing = steerSessions.get(event.sessionId);
+          if (existing) existing.nativeSessionId = readNativeSessionId(event.persistence);
+        } else if (event.type === 'session.prompt_result' && event.result.type === 'turn') {
+          const existing = steerSessions.get(event.sessionId);
+          if (existing) existing.activeTurnId = event.result.turnId;
+        } else if (event.type === 'session.turn') {
+          const existing = steerSessions.get(event.sessionId);
+          if (existing) {
+            if (event.state === 'started') existing.activeTurnId = event.turnId;
+            else if (existing.activeTurnId === event.turnId) existing.activeTurnId = null;
+          }
+        } else if (event.type === 'session.closed' || event.type === 'session.runtime_failed') {
+          steerSessions.delete(event.sessionId);
+        }
+        emitBridgeEvent(event);
+      });
+
+      const bridgeAwareInner: ProviderConnection = {
+        version: rawInner.version,
+        capabilities: connectionCapabilities,
+        onEvent(listener) {
+          bridgeListeners.add(listener);
+          return () => {
+            bridgeListeners.delete(listener);
+          };
+        },
+        async close() {
+          try {
+            await rawInner.close();
+          } finally {
+            unsubscribeRaw();
+            steerSessions.clear();
+            activeBridges.clear();
+            bridgeListeners.clear();
+          }
+        },
+        async send(input) {
+          if (input.type === 'session.open' && !hasExplicitTransport) {
+            const freshEnv = (await extra.resolveRuntimeEnv?.()) ?? {};
+            pendingSessionEnvs.push({
+              ...process.env,
+              ...freshEnv,
+              ...(request.launch?.env ?? {}),
+              ...input.config.env,
+            } as Record<string, string>);
+          }
+          if (input.type === 'session.prompt' && input.prompt.delivery === 'steer') {
+            const state = steerSessions.get(input.sessionId);
+            const nativeId = state?.nativeSessionId;
+            if (steerEnabled && nativeId && state.activeTurnId) {
+              const bridge = [...activeBridges].find(candidate => candidate.canSteer(nativeId));
+              if (bridge) {
+                const accepted = await bridge.steer(nativeId, toAcpPromptBlocks(input.prompt));
+                if (accepted && state.activeTurnId) {
+                  emitBridgeEvent({
+                    type: 'session.prompt_result',
+                    sessionId: input.sessionId,
+                    clientMessageId: input.prompt.clientMessageId,
+                    result: { type: 'steer', turnId: state.activeTurnId },
+                  });
+                  return;
+                }
+              }
+            }
+            emitBridgeEvent({
+              type: 'session.prompt_result',
+              sessionId: input.sessionId,
+              clientMessageId: input.prompt.clientMessageId,
+              result: { type: 'completed' },
+            });
+            return;
+          }
+          return rawInner.send(input);
+        },
+      };
+
+      const connection = withNativeFullAccess(bridgeAwareInner, {
         onSessionPersistence: extra.onSessionPersistence,
       });
 

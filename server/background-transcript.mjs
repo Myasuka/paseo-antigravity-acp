@@ -253,6 +253,24 @@ export class BackgroundProjection {
     this.drainedThoughts = [];
     this.drainedMessages = [];
     this.drainedToolSigs = [];
+    this.expectedUserInputs = 1;
+    this.usageForegroundEnd = null;
+  }
+
+  freezeUsageForegroundEnd() {
+    if (this.usageForegroundEnd === null) {
+      this.usageForegroundEnd = this.foregroundEnd;
+    }
+  }
+
+  beginSteer() {
+    let currentInputs = 0;
+    for (const row of this.rows.values()) {
+      if (row.type === 'USER_INPUT') currentInputs++;
+    }
+    this.expectedUserInputs = Math.max(this.expectedUserInputs, currentInputs) + 1;
+    this.currentGroup = null;
+    this.currentThoughtGroup = null;
   }
 
   observe(update) {
@@ -323,7 +341,7 @@ export class BackgroundProjection {
 
   inspect({ publish = false, flushForegroundOnly = false } = {}) {
     const rows = [...this.rows.values()].sort((a, b) => a.step_index - b.step_index);
-    if (rows.filter(row => row.type === 'USER_INPUT').length > 1) {
+    if (rows.filter(row => row.type === 'USER_INPUT').length > this.expectedUserInputs) {
       return { seenBackground: true, foreignInput: true, drained: false };
     }
     const matchedTools = new Set();
@@ -332,9 +350,11 @@ export class BackgroundProjection {
       const refs = (row.tool_calls ?? []).map((call, index) => {
         const input = decodeArgs(call.args);
         const key = `${row.step_index}:${index}`;
-        const raw = [...this.tools.values()].find(
-          tool => !matchedTools.has(tool.id) && signature(tool.name, tool.input) === signature(call.name, input),
-        );
+        const raw = this.sent.has(`call:${key}`)
+          ? undefined
+          : [...this.tools.values()].find(
+              tool => !matchedTools.has(tool.id) && signature(tool.name, tool.input) === signature(call.name, input),
+            );
         if (raw) {
           matchedTools.add(raw.id);
           this.foregroundEnd = Math.max(this.foregroundEnd, row.step_index);
@@ -343,15 +363,20 @@ export class BackgroundProjection {
       });
       if (refs.length) calls.set(row.step_index, refs);
     }
-    const plannerRows = rows.filter(row => row.type === 'PLANNER_RESPONSE' && row.content?.trim());
+    const plannerRows = rows.filter(
+      row => row.type === 'PLANNER_RESPONSE' && row.content?.trim() && !this.sent.has(`message:${row.step_index}`),
+    );
     const groupMatch = matchForegroundGroups(this.groups, plannerRows, 'content');
     for (const step of groupMatch.covered) this.covered.add(step);
     this.foregroundEnd = Math.max(this.foregroundEnd, groupMatch.foregroundEnd);
 
-    const thoughtRows = rows.filter(row => row.type === 'PLANNER_RESPONSE' && row.thinking?.trim());
+    const thoughtRows = rows.filter(
+      row => row.type === 'PLANNER_RESPONSE' && row.thinking?.trim() && !this.sent.has(`thought:${row.step_index}`),
+    );
     const thoughtMatch = matchForegroundGroups(this.thoughtGroups, thoughtRows, 'thinking');
     for (const step of thoughtMatch.covered) this.coveredThoughts.add(step);
     this.foregroundEnd = Math.max(this.foregroundEnd, thoughtMatch.foregroundEnd);
+    const usageBoundary = this.usageForegroundEnd ?? this.foregroundEnd;
 
     const queue = [];
     const pending = new Map();
@@ -467,7 +492,7 @@ export class BackgroundProjection {
             if (emittedCall) this.drainedToolSigs.push(signature(ref.name, ref.input));
           }
         }
-        if (row.step_index > this.foregroundEnd && row.status === 'DONE') {
+        if (row.step_index > usageBoundary && row.status === 'DONE') {
           const input = row.input_tokens ?? 0;
           const output = row.output_tokens ?? 0;
           const cached = row.cache_read_tokens ?? 0;
@@ -476,6 +501,11 @@ export class BackgroundProjection {
           extraUsage.cachedReadTokens += cached;
           extraUsage.totalTokens += input + output + cached;
         }
+      } else if (row.type === 'USER_INPUT' && row.step_index > usageBoundary) {
+        lastPlannerStep = -1;
+        lastPlannerCalls = [];
+        genericsSinceLastPlanner = [];
+        lastWake = Math.max(lastWake, row.step_index);
       } else if (row.type === 'GENERIC' && queue.length) {
         genericsSinceLastPlanner.push(row);
         const ref = queue.shift();
